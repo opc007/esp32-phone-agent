@@ -1,0 +1,145 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 8c318f1..b20d3fc 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -1002,6 +1002,38 @@ file(GLOB BOARD_SOURCES
+ )
+ list(APPEND SOURCES ${BOARD_SOURCES})
+ 
++# 手机控制（BLE/USB HID + Portal）默认关闭。
++# 原因：这块板子同时跑 LCD + 摄像头 + AFE 唤醒词 + WiFi 音频时，内部 SRAM 极紧；
++# 开启 HID 后稳态只剩约 6.8KB，进入聆听时 EspUdp 建 receive task 会 ENOMEM，
++# 表现为「按了/喊了没反应，立刻弹回 idle」。社区方案（云端 MCP + 电脑侧 ADB）
++# 不需要固件里的 HID，因此默认关闭，把内存还给语音。
++# 想重新启用：cmake -DPHONE_HID_ENABLE=ON，并在 sdkconfig 打开 BT/NimBLE/HID。
++option(PHONE_HID_ENABLE "板载 BLE/USB HID + Portal 工具（占内部 SRAM）" OFF)
++if(NOT PHONE_HID_ENABLE)
++    list(FILTER SOURCES EXCLUDE REGEX
++        "/(phone_hid|phone_ble_hid|phone_hid_controller|portal_client|portal_tools|usb_descriptors|esp_hid_gap)\\.(cc|c)$")
++    message(STATUS "手机 HID/Portal 模块: 关闭（语音优先，省内部 SRAM）")
++else()
++    message(STATUS "手机 HID/Portal 模块: 开启")
++endif()
++
++# 设备端「控制这台 Mac」MCP 工具：只有一个轻量 HTTP 客户端，不启蓝牙。
++# 走小智原生语音通道上报工具，因此不需要小智后台的 MCP 接入点。
++option(MAC_CONTROL_ENABLE "设备端 MCP 工具：WiFi 控制这台 Mac" ON)
++set(_MAC_BOARD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}")
++if(MAC_CONTROL_ENABLE)
++    # portal_client.cc 可能已被上面的 PHONE_HID 过滤移除；先去重再加回，避免重复编译。
++    # 它独立于蓝牙/HID，且已修过 POST 方法与栈溢出两个真实 bug。
++    if(EXISTS "${_MAC_BOARD_DIR}/portal_client.cc")
++        list(REMOVE_ITEM SOURCES "${_MAC_BOARD_DIR}/portal_client.cc")
++        list(APPEND SOURCES "${_MAC_BOARD_DIR}/portal_client.cc")
++    endif()
++    message(STATUS "Mac 设备端控制工具: 开启（self.mac.*）")
++else()
++    list(FILTER SOURCES EXCLUDE REGEX "/mac_control_tools\\.(cc|c)$")
++    message(STATUS "Mac 设备端控制工具: 关闭")
++endif()
++
+ # Select one audio engine for each chip family
+ if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_ESP32S31)
+     list(APPEND SOURCES "audio/engines/afe_audio_engine.cc")
+@@ -1170,6 +1202,16 @@ set(MAIN_PRIV_REQUIRES_EXTRA "")
+ if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)
+     list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__ip101)
+ endif()
++if(CONFIG_IDF_TARGET_ESP32S3 AND CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI_CAM AND PHONE_HID_ENABLE)
++    list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__esp_tinyusb esp_http_client esp_hid)
++endif()
++if(MAC_CONTROL_ENABLE AND EXISTS "${_MAC_BOARD_DIR}/portal_client.cc")
++    list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_client)
++endif()
++# ESP32 自托管引导页 + 手机直连协议桥（httpd 服务端，APK 内嵌在 rodata）
++if(EXISTS "${_MAC_BOARD_DIR}/phone_bridge.cc")
++    list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_server)
++endif()
+ if(BOARD_TYPE STREQUAL "m5stack-stick-s3")
+     list(APPEND MAIN_PRIV_REQUIRES_EXTRA
+         m5stack__m5pm1
+@@ -1218,6 +1260,7 @@ idf_component_register(SRCS ${SOURCES}
+                         efuse
+                         bt
+                         fatfs
++                        esp_http_client
+                         xiaozhi-fonts
+                         ${MAIN_PRIV_REQUIRES_EXTRA}
+                     )
+@@ -1226,6 +1269,9 @@ idf_component_register(SRCS ${SOURCES}
+ # dialect; pin the baseline so main/ does not depend on it.
+ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+     target_compile_options(${COMPONENT_LIB} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++23>)
++    target_compile_definitions(${COMPONENT_LIB} PRIVATE
++        PHONE_HID_ENABLE=$<BOOL:${PHONE_HID_ENABLE}>
++        MAC_CONTROL_ENABLE=$<BOOL:${MAC_CONTROL_ENABLE}>)
+ endif()
+ 
+ # Use target_compile_definitions to define the reported board identity
+diff --git a/main/application.cc b/main/application.cc
+index e1f0719..1b80ceb 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -20,6 +20,12 @@
+ #include <cstring>
+ #include <limits>
+ 
++#if MAC_CONTROL_ENABLE
++// 弱符号：板级 Mac 控制模块编译时才会链接到实现；模块关闭时地址为空，自动跳过。
++// 放在这里而不是 include 板级头文件，避免 main 组件依赖具体板型的头文件路径。
++extern "C" __attribute__((weak)) bool MacVoiceCommandHook(const char* text);
++#endif
++
+ #define TAG "Application"
+ 
+ Application::Application() : notify_player_(audio_service_) {
+@@ -686,6 +692,13 @@ void Application::InitializeProtocol() {
+                     glyphs.clear();
+                 }
+                 ESP_LOGI(TAG, ">> %s", text->valuestring);
++#if MAC_CONTROL_ENABLE
++                // 本地语音指令兜底：只要听清了这句话就执行控制动作，
++                // 不依赖云端大模型是否决定调用 MCP 工具。
++                if (MacVoiceCommandHook != nullptr) {
++                    MacVoiceCommandHook(text->valuestring);
++                }
++#endif
+                 Schedule([display, message = std::string(text->valuestring),
+                           glyphs = std::move(glyphs), bpp]() {
+                     display->AddTextGlyphs(glyphs, bpp);
+@@ -702,6 +715,9 @@ void Application::InitializeProtocol() {
+         } else if (strcmp(type->valuestring, "mcp") == 0) {
+             auto payload = cJSON_GetObjectItem(root, "payload");
+             if (cJSON_IsObject(payload)) {
++                auto method = cJSON_GetObjectItem(payload, "method");
++                ESP_LOGI(TAG, "[MCP-IN] method=%s",
++                         cJSON_IsString(method) ? method->valuestring : "(none)");
+                 McpServer::GetInstance().ParseMessage(payload);
+             }
+         } else if (strcmp(type->valuestring, "system") == 0) {
+diff --git a/main/idf_component.yml b/main/idf_component.yml
+index c9c64ec..ba8eb08 100644
+--- a/main/idf_component.yml
++++ b/main/idf_component.yml
+@@ -1,5 +1,9 @@
+ ## IDF Component Manager Manifest File
+ dependencies:
++  espressif/esp_tinyusb:
++    version: "^1.7"
++    rules:
++    - if: target in [esp32s3, esp32p4]
+   espressif/ip101:
+     version: ^1.1.0
+     rules:
+diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
+index ac591b5..7567276 100644
+--- a/main/protocols/protocol.cc
++++ b/main/protocols/protocol.cc
+@@ -100,6 +100,7 @@ void Protocol::SendStopListening() {
+ }
+ 
+ void Protocol::SendMcpMessage(const std::string& payload) {
++    ESP_LOGI(TAG, "[MCP-OUT] %u bytes: %.140s", (unsigned)payload.size(), payload.c_str());
+     std::string message =
+         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
+     SendText(message);

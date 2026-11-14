@@ -1,179 +1,148 @@
-# ESP32-S3 Phone Agent
+# xiaozhi-phone-control
 
-**Control an Android phone with an ESP32-S3 — no PC, no ADB host, no root.**
+**ESP32 语音直连控制安卓手机** —— 几十块的 ESP32-S3 + 一台手机，中间不需要电脑。
 
-An ESP32-S3 board connects to the phone's Wi-Fi hotspot, talks to the
-[Mobilerun Portal](https://github.com/droidrun/mobilerun) app over HTTP, reads the
-accessibility tree, asks a DeepSeek model what to do next, and taps/swipes/types on
-the phone. The whole agent loop runs on the microcontroller; the board only needs
-USB power once it is flashed.
+对着小智说「打开美团，帮我找一下奶茶多少钱」，ESP32 自己解析整句、操控手机上的美团、
+搜索奶茶、把屏幕上的真实价格读回来念给你听 —— 全程 5.2 秒。
 
-> 中文简介：一块 ESP32-S3 自制“手机操作盒子”。上电 → 连手机热点 → 通过手机上的
-> Mobilerun Portal 读取界面文字/控件 → 调 DeepSeek 决策 → 自动点按/滑动/输入，
-> 最后把结果打印出来。**全程不需要电脑**（USB 只在烧录/看日志时用）。
+![hero](docs/images/hero.png)
 
-```
-┌─────────────────────────┐      Wi-Fi (2.4 GHz)      ┌──────────────────────────┐
-│ ESP32-S3 (MicroPython)  │  HTTP :8080 Bearer token  │ Android phone            │
-│  · Wi-Fi STA            │ ◄───────────────────────► │  · Mobilerun Portal      │
-│  · Portal HTTP client   │                           │    - accessibility tree  │
-│  · DeepSeek HTTPS       │                           │    - tap / swipe / input │
-│  · agent loop           │                           └──────────────────────────┘
-│  · BOOT button = abort  │            HTTPS
-└───────────┬─────────────┘   ┌──────────────────────┐
-            └───────────────► │ api.deepseek.com     │
-                              │ deepseek-v4-pro      │
-                              └──────────────────────┘
-```
+## 它是怎么工作的
 
-## Verified results
+![架构](docs/images/architecture.svg)
 
-Tested on an ESP32-S3 (N16R8: 16 MB flash + 8 MB octal PSRAM) and a OnePlus Ace 6T
-(Android 16), with the phone hotspot enabled and Portal 0.7.25 installed:
+- **ESP32-S3** 烧录小智固件（语音、屏幕、唤醒词、云端大脑全部保留），新增 `phone_bridge`：
+  中文整句 → 动作序列 → 每步回读真实屏幕。
+- **手机端** 只装一个 19KB 的 App（[orb-eye](https://github.com/EatTake/orb-eye)，MIT 协议）：
+  一个无障碍服务 + 手机内置 HTTP 服务。**不需要 ADB、不需要 root、不需要 Termux、不需要电脑。**
+- 那根 type-C 线只负责供电。数据走 WiFi：小智大脑本来就在云端；而且 Android 不允许外部 USB
+  配件读屏或注入操作，这块板的 USB 引脚还与屏幕复用（实测开 USB 直接黑屏）。
+- **自动发现**：手机连上同一 WiFi、浏览器打开 ESP32 引导页之后，ESP32 自己记住手机地址
+  （引导页来访 IP → NVS 记忆 → 同网段扫描三重保障），换手机、换路由器都不用手填 IP。
 
-| Task (natural language) | Steps | Result |
-|---|---|---|
-| 打开设置，找到 Android 版本 | 12 | ✅ answered `Android 16` |
-| 打开设置，查看电池剩余电量 | 6 | ✅ answered `15%` (matches `dumpsys battery`) |
+一句话的完整执行流程：
 
-![evidence](evidence-esp32-android16.png)
+![流程](docs/images/flow.svg)
 
-## How it works
+## 核心特性
 
-1. **Phone side**: install the open-source Mobilerun Portal app (or use the
-   `mobilerun setup` CLI) and enable its accessibility service. Portal exposes a
-   local HTTP API on `0.0.0.0:8080` protected by a Bearer token.
-2. **ESP32 side**: MicroPython firmware in `firmware/`:
-   - `main.py` — join the phone hotspot, find Portal via the DHCP gateway, run the task.
-   - `portal.py` — tiny HTTP client for the Portal contract (`/state`, `/tap`,
-     `/swipe`, `/keyboard/*`, `/app`).
-   - `llm.py` — minimal HTTPS client for DeepSeek chat completions.
-   - `agent.py` — compresses the a11y tree, builds the prompt, parses one JSON
-     action per step, executes it, repeats until `done` (max steps bounded).
-3. **Actions**: `tap`, `tap_text` (tap by visible label — much more reliable),
-   `swipe`, `input`, `key` (back/home/enter/delete), `open` (start an app), `wait`, `done`.
+| 能力 | 说明 |
+|---|---|
+| 🗣️ 整句自然语言 | 「打开手机上的美团，搜一下奶茶多少钱」「读一下手机屏幕」「按回车」「上滑」 |
+| 📱 动态读 APP | 应用列表实时从手机桌面图标读取中文名，**不写死任何包名映射**，换手机自动适应 |
+| 👀 真实读屏 | 基于无障碍控件树回读屏幕文字，看到什么说什么，不编造价格、不伪造「已发送」 |
+| ✍️ 中文输入 | `ACTION_SET_TEXT` 直接写输入框，无需第三方输入法 |
+| 🔐 敏感动作二次确认 | 发消息 / 回复 / 下单必须再说「确认执行 + 8位码」，重放同一码会被拒绝 |
+| 🚫 合规红线 | 支付、密码、验证码永不自动执行；不提供任何绕过平台风控的能力 |
+| 🖥️ 10 个 MCP 工具 | `self.phone.control` 等工具走小智原生语音通道上报，云端大模型可直接调用 |
+| 🔁 双链路 | 手机离线超 20 秒自动回退「语音控制电脑」链路（`macset` 切换，见下文） |
 
-## Requirements
+## 快速开始
 
-- **Hardware**: ESP32-S3 devkit (8 MB PSRAM recommended; boards without PSRAM can
-  still run text-only tasks). USB cable for flashing/power.
-- **Phone**: Android with the Mobilerun Portal app (MIT). Only USB debugging is
-  needed once to read Portal's token.
-- **DeepSeek API key**: https://platform.deepseek.com
-- **PC (one-time only)**: Python 3 with `esptool` and `mpremote`.
+### 1. 烧录固件（二选一）
 
-```powershell
-python -m pip install esptool mpremote
+```bash
+# 方式 A：直接烧预编译固件（最快）
+pip install esptool
+cd tools && ./flash_prebuilt.sh /dev/cu.usbserial-XXXX
+
+# 方式 B：从源码构建（需要 ESP-IDF v6.1）
+git clone https://github.com/78/xiaozhi-esp32.git ~/esp/xiaozhi-esp32
+cd firmware && ./apply.sh ~/esp/xiaozhi-esp32
+# 然后按 firmware/BUILD.md 编译烧录
 ```
 
-## Quick start
+烧完串口（115200）会打印：`手机接入引导页: http://192.168.x.x/`
 
-### 1. Prepare the phone
+### 2. 手机接入（约 2 分钟，只做一次）
 
-1. Install the Mobilerun Portal app on the phone and enable its accessibility service
-   (easiest: run `mobilerun setup` from a PC once, or install the APK manually).
-2. Turn on the phone's **Personal Hotspot**, set the band to **2.4 GHz** (ESP32-S3 has
-   no 5 GHz radio), and note the SSID/password. Keep the hotspot on.
-3. Read the Portal token once over adb:
+1. 手机连上与 ESP32 **同一个 WiFi**
+2. 浏览器打开引导页 → 点击下载 19KB App → 安装
+3. 设置 → 无障碍 → 打开 Orb Eye 开关
+4. 回到引导页看到绿色「已连接」—— ESP32 已经自动记住手机，之后不用再管
 
-   ```powershell
-   adb shell content query --uri content://com.mobilerun.portal/auth_token
-   ```
+> 装应用和开无障碍开关这两步 Android 强制要求本人操作，这是系统安全边界，本项目不提供也不应该提供绕过方式。
 
-   The token is stable for one Portal installation; it only changes on reinstall.
+### 3. 开口说话
 
-### 2. Configure the firmware
+对 ESP32 上的小智直接说：
 
-```powershell
-copy firmware\config.example.py firmware\config.py
-# edit firmware\config.py: WIFI_SSID, WIFI_PASSWORD, PORTAL_TOKEN, DEEPSEEK_API_KEY, TASK
-```
+> 「打开手机上的美团，帮我找一下奶茶多少钱」
+> 「手机屏幕上现在显示什么」
+> 「用手机上的微信给张三发消息说明天见」 → 会先要确认码，再说「确认执行 38f2a1c9」才真正发送
+> 「打开手机上的 QQ音乐，播放世上只有妈妈好」
 
-`firmware/config.py` is git-ignored — never commit real secrets.
+没有手机在旁边？串口自测命令同样走完整链路：`macphone 打开美团找一下奶茶多少钱`
 
-### 3. Download MicroPython images (once)
-
-```powershell
-python tools\download_firmware.py
-```
-
-### 4. Flash the board
-
-Hold **BOOT**, plug USB (or press RST), release BOOT after ~2 s, then:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File flash.ps1
-```
-
-The script detects the board, reads chip/flash info, flashes the matching MicroPython
-image at `0x0`, uploads the firmware files and resets. For later task changes only:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy.ps1
-```
-
-### 5. Run without a PC
-
-Give the board any USB power (charger/power bank). It connects to the hotspot, runs
-`TASK` from `config.py`, prints the result over serial, and stops. Press **BOOT**
-during a run to abort.
-
-To watch logs while USB is connected:
-
-```powershell
-python -m mpremote connect COM9 repl     # Ctrl-] to exit
-```
-
-## Tweaking
-
-- **Task**: edit `TASK` and `MAX_STEPS` in `firmware/config.py`, then `deploy.ps1`.
-- **Model**: `DEEPSEEK_MODEL` — `deepseek-v4-pro` (better planning) or
-  `deepseek-flash` (faster/cheaper). Reasoning models need a larger `max_tokens`
-  (already set to 8000 in `llm.py`).
-- **Vision**: not supported on purpose — Portal screenshots are ~4 MB each, which is
-  impractical for the microcontroller. The agent reasons over the accessibility tree.
-- **PC prototyping**: `tools/agent_pc.py` runs the same agent logic on a PC through
-  `adb forward tcp:18080 tcp:8080`, useful when tuning prompts before flashing.
-
-## Known limitations
-
-- No vision: apps that expose little to the accessibility tree (games, some WebViews)
-  will be hard to operate.
-- 3–10 s per step (the model thinks); long tasks may hit the step limit.
-- Typing text (`input`) requires the **Portal keyboard** to be the active IME:
-  `adb shell ime set com.mobilerun.portal/.input.MobilerunKeyboardIME`.
-- The task is compiled into `config.py`; there is no on-device task input yet.
-- Phone hotspot must stay on; token must be refreshed if Portal is reinstalled.
-- One phone at a time. Automation may violate some apps' terms of service — use only
-  on devices you own and for tasks you are allowed to automate.
-
-## Repository layout
+## 仓库结构
 
 ```
-esp32-phone-agent/
-├── firmware/
-│   ├── config.example.py   # copy to config.py and fill in
-│   ├── main.py             # boot entry: Wi-Fi → Portal → run
-│   ├── portal.py           # Portal HTTP client
-│   ├── llm.py              # DeepSeek HTTPS client
-│   └── agent.py            # a11y tree → model decision → actions
-├── tools/
-│   ├── download_firmware.py  # fetch MicroPython images
-│   ├── agent_pc.py           # PC prototype for prompt tuning
-│   └── serial_log.py         # reset board and capture serial output
-├── flash.ps1               # flash MicroPython + deploy firmware
-├── deploy.ps1              # re-upload firmware files only
-├── ARCHITECTURE.md         # protocol notes, design decisions, risks
-├── evidence-esp32-android16.png
-└── LICENSE (MIT)
+├── docs/
+│   ├── ESP32_DIRECT.md        # 完整设计文档（架构、协议、边界、排错）
+│   └── images/                # 架构图 / 流程图 / 主视觉
+├── firmware/                  # 对 xiaozhi-esp32 上游的完整改动
+│   ├── board/                 # 板级源码（phone_bridge 等，见 BUILD.md）
+│   ├── patches/               # 上游非板级文件补丁
+│   ├── sdkconfig.board        # 可复现的完整 sdkconfig
+│   ├── apply.sh               # 一键应用
+│   └── BUILD.md               # 构建 / 烧录 / 串口命令 / 踩坑记录
+├── prebuilt/                  # 预编译固件（bootloader/分区表/otadata/app/assets）
+└── tools/
+    ├── phone_apk/             # orb-eye APK + 无障碍服务源码（MIT）
+    ├── mock_orb_eye.py        # 模拟一台手机，无需真机即可端到端自测
+    ├── mock_adb.py            # 模拟手机（ADB 通道）
+    ├── computer_portal.py     # 可选的「语音控制电脑」Portal（Mac/Linux）
+    ├── android_adb.py / ax_ui.py / browser_cdp.py   # Portal 的三个执行后端
+    ├── ADBKeyboard.apk        # ADB 通道的中文输入法（可选链路用）
+    ├── flash_prebuilt.sh      # 预编译固件烧录脚本
+    └── start_computer_portal.sh  # 电脑 Portal 启动脚本（可选链路用）
 ```
 
-## Credits & license
+## 无需真机的自测
 
-- [Mobilerun](https://github.com/droidrun/mobilerun) (formerly DroidRun) — Portal app
-  and HTTP contract, MIT.
-- [MicroPython](https://micropython.org) — ESP32-S3 runtime, MIT.
-- DeepSeek API — LLM inference (bring your own key).
+```bash
+python3 tools/mock_orb_eye.py 7333 &     # 模拟一台已装好 App 的手机
+# ESP32 串口执行：phonebind <运行 mock 的机器IP>，随后
+# ESP32 串口执行：macphone 打开美团帮我找一下奶茶多少钱
+# → 约 5 秒后读回：喜茶 18 元 / 奈雪 22 元 / 蜜雪冰城 7 元
+```
 
-This project is MIT licensed; see [LICENSE](LICENSE).
-Not affiliated with DeepSeek or Dataelem; use at your own risk.
+## 可选链路：语音控制电脑
+
+同一套 10 个 MCP 工具也支持控制电脑（打开 App、真实读屏、微信发消息、QQ音乐点歌、
+CDP 控制浏览器），在电脑上运行：
+
+```bash
+cd tools && ./start_computer_portal.sh 8080 mytoken
+# ESP32 串口执行：macset <电脑IP>:8080 mytoken
+```
+
+手机离线超过 20 秒，固件也会自动回退到这条链路。
+
+## 为什么不用蓝牙 / USB 直连？
+
+早期版本都试过，都实测过：
+
+- **BLE HID**：Android 上只注入按键流，拿不到屏幕内容和 APP 状态，等于盲按；
+  且与语音链路抢内存（稳态只剩 ~7KB，聆听时直接 ENOMEM）。
+- **USB HID**：这块板的原生 USB D-/D+ 是 GPIO19/20，与 LCD 复用，开 USB 立刻黑屏；
+  Android 也不给 USB 配件读屏权限。
+- 结论：**读得到屏幕才谈得上控制**，所以最终方案是 WiFi + 无障碍服务。
+
+详见 `docs/ESP32_DIRECT.md` 的完整推演过程。
+
+## 安全须知
+
+- orb-eye 的 HTTP 服务绑定 `0.0.0.0` 且无鉴权，**请只在可信 WiFi 使用**，
+  不要把手机端口暴露到公网。
+- 发消息、回复、下单必须二次确认；支付/密码/验证码永不自动执行。
+- 部分金融类 App 检测到无障碍服务会限制功能——这是平台策略，本项目不绕过。
+- iPhone 非越狱没有等价通道，本方案只覆盖 Android。
+
+## 致谢与许可
+
+- [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) — 小智 AI 语音助手（MIT）
+- [EatTake/orb-eye](https://github.com/EatTake/orb-eye) — Android 无障碍 HTTP 服务（MIT）
+- [senzhk/ADBKeyBoard](https://github.com/senzhk/ADBKeyBoard) — ADB 中文输入法（Apache-2.0，可选链路使用）
+
+本项目代码以 **MIT** 协议开源，见 [LICENSE](LICENSE)。

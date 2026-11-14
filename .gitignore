@@ -1,12 +1,29 @@
-# local / generated files
+# Python
 __pycache__/
 *.py[cod]
-firmware/config.py
-firmware/*.bin
+*.log
 tmp/
 .venv*/
-*.log
+
+# 本机工作区数据 / 记忆
+.workbuddy/
+
+# 历史实验目录（不属于最新方案）
+esp32-cdc-keyboard/
+firmware_arduino/
+firmware_ble_hid/
+firmware_micropython/
+firmware_s3_usb/
+firmware_voice/
+pio_project/
+xiaozhi-AutoGLM-mcp/
+tools/platform-tools*
+tools/e2e_work/
+e2e_work/
 
 # OS noise
-Thumbs.db
+crash_log.txt
+evidence-*.png
+*.zip
 .DS_Store
+Thumbs.db

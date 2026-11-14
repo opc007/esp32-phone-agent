@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 600" font-family="PingFang SC, Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/><stop offset="1" stop-color="#eef2f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="920" height="600" fill="url(#bg)" rx="14"/>
+  <text x="460" y="42" text-anchor="middle" font-size="26" font-weight="700" fill="#0f172a">ESP32 语音直连手机 · 总体架构</text>
+  <text x="460" y="68" text-anchor="middle" font-size="14" fill="#64748b">几十块的 ESP32-S3 + 一台安卓手机，中间不需要电脑、ADB、root 或 Termux</text>
+
+  <!-- 用户 -->
+  <g>
+    <rect x="30" y="240" width="150" height="120" rx="12" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>
+    <text x="105" y="285" text-anchor="middle" font-size="34">🗣️</text>
+    <text x="105" y="318" text-anchor="middle" font-size="16" font-weight="600" fill="#075985">用户</text>
+    <text x="105" y="340" text-anchor="middle" font-size="12" fill="#0369a1">说一句中文即可</text>
+  </g>
+
+  <!-- ESP32 -->
+  <g>
+    <rect x="240" y="150" width="240" height="300" rx="14" fill="#dcfce7" stroke="#16a34a" stroke-width="2.5"/>
+    <text x="360" y="182" text-anchor="middle" font-size="18" font-weight="700" fill="#14532d">ESP32-S3（小智固件）</text>
+    <text x="360" y="206" text-anchor="middle" font-size="12" fill="#166534">语音 / 屏幕 / 唤醒词全部保留</text>
+    <line x1="256" y1="220" x2="464" y2="220" stroke="#86efac" stroke-width="1"/>
+    <text x="360" y="242" text-anchor="middle" font-size="13" fill="#14532d">• 麦克风阵列 + LCD 屏</text>
+    <text x="360" y="264" text-anchor="middle" font-size="13" fill="#14532d">• 10 个设备端 MCP 工具</text>
+    <text x="360" y="286" text-anchor="middle" font-size="13" fill="#14532d">• phone_bridge：中文整句→动作序列</text>
+    <text x="360" y="308" text-anchor="middle" font-size="13" fill="#14532d">• 引导页 :80（托管 19KB APK）</text>
+    <text x="360" y="330" text-anchor="middle" font-size="13" fill="#14532d">• 自动发现：来访IP / NVS / 网段扫描</text>
+    <text x="360" y="352" text-anchor="middle" font-size="13" fill="#14532d">• 敏感动作二次确认 + 去重</text>
+    <text x="360" y="382" text-anchor="middle" font-size="11" fill="#15803d">type-C 线只负责供电，数据走 WiFi</text>
+  </g>
+
+  <!-- 云端 -->
+  <g>
+    <rect x="580" y="60" width="300" height="120" rx="12" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+    <text x="730" y="100" text-anchor="middle" font-size="18" font-weight="700" fill="#4c1d95">☁️ 小智云端大脑</text>
+    <text x="730" y="126" text-anchor="middle" font-size="12" fill="#5b21b6">大模型理解意图，tools/call 调用设备工具</text>
+    <text x="730" y="148" text-anchor="middle" font-size="12" fill="#5b21b6">TTS 语音合成 · MCP 协议</text>
+  </g>
+
+  <!-- 手机 -->
+  <g>
+    <rect x="580" y="300" width="300" height="200" rx="14" fill="#ffedd5" stroke="#ea580c" stroke-width="2.5"/>
+    <text x="730" y="332" text-anchor="middle" font-size="18" font-weight="700" fill="#7c2d12">📱 安卓手机</text>
+    <text x="730" y="356" text-anchor="middle" font-size="12" fill="#9a3412">装一个 19KB App（orb-eye，MIT）</text>
+    <line x1="596" y1="370" x2="864" y2="370" stroke="#fed7aa" stroke-width="1"/>
+    <text x="730" y="392" text-anchor="middle" font-size="13" fill="#7c2d12">• 无障碍服务 + HTTP :7333</text>
+    <text x="730" y="414" text-anchor="middle" font-size="13" fill="#7c2d12">• 读控件树 / 点击 / 中文输入 / 滑动</text>
+    <text x="730" y="436" text-anchor="middle" font-size="13" fill="#7c2d12">• 应用名从桌面图标动态读取</text>
+    <text x="730" y="458" text-anchor="middle" font-size="13" fill="#7c2d12">• 无 root · 无 ADB · 不读锁屏密码</text>
+    <text x="730" y="484" text-anchor="middle" font-size="11" fill="#c2410c">装 APK、开无障碍开关各需本人点一次</text>
+  </g>
+
+  <!-- 箭头 -->
+  <path d="M185 295 L235 295" stroke="#475569" stroke-width="2.2" marker-end="url(#arr)"/>
+  <text x="210" y="283" text-anchor="middle" font-size="12" fill="#475569">语音</text>
+
+  <path d="M445 360 C 520 340, 530 180, 578 130" fill="none" stroke="#475569" stroke-width="2.2" marker-end="url(#arr)"/>
+  <text x="530" y="205" text-anchor="middle" font-size="12" fill="#475569">WiFi / MQTT</text>
+
+  <path d="M578 165 C 500 190, 490 220, 446 250" fill="none" stroke="#475569" stroke-width="2.2" stroke-dasharray="6 4" marker-end="url(#arr)"/>
+  <text x="505" y="245" text-anchor="middle" font-size="12" fill="#475569">tools/call</text>
+
+  <path d="M484 380 L578 390" stroke="#475569" stroke-width="2.2" marker-end="url(#arr)"/>
+  <text x="530" y="370" text-anchor="middle" font-size="12" fill="#475569">WiFi · HTTP（自动发现）</text>
+
+  <text x="460" y="555" text-anchor="middle" font-size="13" fill="#334155">实测：说「打开美团帮我找一下奶茶多少钱」→ 5.2 秒完成打开、搜索、读回真实价格</text>
+  <text x="460" y="580" text-anchor="middle" font-size="12" fill="#94a3b8">xiaoZhi Phone Control · MIT</text>
+</svg>
