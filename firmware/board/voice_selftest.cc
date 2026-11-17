@@ -12,6 +12,7 @@
 
 #include "application.h"
 #include "device_state.h"
+#include "danmaku_tools.h"
 #if MAC_CONTROL_ENABLE
 #include "mac_control_tools.h"
 #endif
@@ -60,6 +61,8 @@ static void Run(const std::string& raw) {
                       "macsend <应用> <联系人> <内容> | macscreen(读真实屏幕) | "
                       "mactest(模拟云端调用工具) | mac(测连通) | macstatus | "
                       "macclick <x> <y> | macinput <文字> | macset <IP:8080> [token] | "
+                      "macphoto [问题](拍照+视觉) | macdanmaku(拍照读弹幕) | "
+                      "macdanmakureset | macdanmakuweb [整句](抖音网页弹幕) | "
                       "phonestatus | phonebind <手机IP>");
     } else if (cmd == "state") {
         int s = (int)Application::GetInstance().GetDeviceState();
@@ -70,7 +73,8 @@ static void Run(const std::string& raw) {
         ESP_LOGI(TAG, "[CMD] < 已调用 ToggleChatState()，看下面状态机是否进入 listening");
 #if MAC_CONTROL_ENABLE
     } else {
-        std::string reply = MacControlConsoleCommand(cmd, args);
+        std::string reply = DanmakuConsoleCommand(cmd, args);
+        if (reply.empty()) reply = MacControlConsoleCommand(cmd, args);
         if (reply.empty()) reply = PhoneBridgeConsoleCommand(cmd, args);
         if (!reply.empty()) {
             ESP_LOGI(TAG, "[CMD] < %s", reply.c_str());
@@ -80,7 +84,12 @@ static void Run(const std::string& raw) {
     }
 #else
     } else {
-        ESP_LOGI(TAG, "[CMD] < 未知命令，输入 help");
+        std::string reply = DanmakuConsoleCommand(cmd, args);
+        if (!reply.empty()) {
+            ESP_LOGI(TAG, "[CMD] < %s", reply.c_str());
+        } else {
+            ESP_LOGI(TAG, "[CMD] < 未知命令，输入 help");
+        }
     }
 #endif
 }

@@ -51,7 +51,9 @@
 #define CAMERA_PIN_SIOD GPIO_NUM_4
 #define CAMERA_PIN_PWDN GPIO_NUM_NC
 #define CAMERA_PIN_RESET GPIO_NUM_NC
-#define XCLK_FREQ_HZ 20000000
+// 面包板杜邦线信号质量差，20MHz XCLK 会导致 OV3660 不出帧（I2C 100kHz 能通，
+// 但并口时钟收不到）。降为 10MHz 提高容错，实测有效后保留。
+#define XCLK_FREQ_HZ 10000000
 
 
 #define DISPLAY_BACKLIGHT_PIN GPIO_NUM_38

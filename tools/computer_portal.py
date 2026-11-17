@@ -65,6 +65,7 @@ _last_music = {"key": "", "ts": 0, "result": ""}  # 点歌去重：本地兜底+
 _last_browser = {"key": "", "ts": 0, "result": ""}  # 浏览器动作去重（同一句双路径）
 _last_phone = {"key": "", "ts": 0, "result": ""}    # 手机动作去重（本地兜底+云端工具）
 _last_phone_app = {"key": "", "ts": 0}              # /app 自动回落到手机的去重
+_last_danmaku_open = {"key": "", "ts": 0}           # 打开直播间去重（同一句双路径）
 _pending = {"token": 0, "payload": None}        # 未登录时挂起的消息，登录成功自动补发
 MUSIC_CACHE = os.path.expanduser("~/Music/xiaozhi")  # 官方试听音频缓存
 _afplay = {"proc": None}                        # 客户端不可播时的出声兜底
@@ -1226,6 +1227,105 @@ def browser_action(d, raw_text=""):
 
 
 # ---------------------------------------------------------------------------
+# 抖音直播弹幕通道。
+#
+# 原理：抖音网页直播（live.douyin.com）不用登录就能进直播间，弹幕是 DOM
+# 原生元素（webcast-chatroom___item，每条「用户名：内容」），用 CDP 直接
+# 读真实页面文字，不拍照、不 OCR、不需要摄像头，比视觉方案稳得多。
+# 去重状态留在电脑端（最近 400 条），「新增弹幕」的判断与调用方无关，
+# 设备端本地兜底和云端 MCP 各调一次也只会播一遍。
+# ---------------------------------------------------------------------------
+
+DOUYIN_LIVE_HOME = "https://live.douyin.com/"
+_danmaku_seen = []          # 已读过的弹幕（保持 DOM 顺序，超出裁掉最老的）
+_danmaku_lock = threading.Lock()
+
+_DOUYIN_DANMAKU_JS = r"""(function(){
+  const items = [];
+  const seen = new Set();
+  document.querySelectorAll('[class*="webcast-chatroom___item"]').forEach(function(e){
+    const t = (e.innerText||'').replace(/\s+/g,' ').trim();
+    // 消息条和它的 wrapper 类名都含 "___item" 且 innerText 相同，按文本去重即天然合并
+    if (t && t.length < 180 && !seen.has(t)) { seen.add(t); items.push(t); }
+  });
+  return JSON.stringify({title: document.title||'', items: items});
+})()"""
+
+
+def douyin_danmaku_read():
+    """读当前直播间弹幕，只返回上次调用以来新出现的。"""
+    b = browser_cdp.get_browser()
+    good, why = b.ensure()
+    if not good:
+        return {"status": "error", "error": why}
+    st = b.state()
+    if "live.douyin.com" not in (st.get("url") or ""):
+        return {"status": "error",
+                "error": "浏览器还没有打开抖音直播间，先说「打开抖音直播间」"}
+    raw = b.eval(_DOUYIN_DANMAKU_JS)
+    try:
+        d = json.loads(raw) if isinstance(raw, str) else {}
+    except Exception:
+        d = {}
+    items = d.get("items", [])
+    with _danmaku_lock:
+        new = [t for t in items if t not in _danmaku_seen]
+        for t in items:
+            if t not in _danmaku_seen:
+                _danmaku_seen.append(t)
+        del _danmaku_seen[:-400]
+        new = new[-50:]
+    return {"status": "success", "room": (d.get("title") or "").strip()[:60],
+            "new_count": len(new), "new": new, "screen_count": len(items)}
+
+
+def douyin_danmaku_open(text="", url=""):
+    """打开抖音直播间：支持直接给房间 URL/房间号，或默认进推荐第一个直播间。"""
+    b = browser_cdp.get_browser()
+    good, why = b.ensure()
+    if not good:
+        return {"status": "error", "error": why}
+    room_url = (url or "").strip()
+    m = re.search(r"live\.douyin\.com/(\d{6,})", (text or "") + " " + (url or ""))
+    if not room_url and m:
+        room_url = "https://live.douyin.com/" + m.group(1)
+    picked = None
+    if room_url:
+        b.navigate(room_url)
+    else:
+        b.navigate(DOUYIN_LIVE_HOME)
+        time.sleep(4)
+        js = r"""(function(){
+          const as=[...document.querySelectorAll('a')];
+          for(const a of as){
+            const mm=(a.href||'').match(/live\.douyin\.com\/(\d{8,})/);
+            if(mm) return JSON.stringify({id:mm[1],title:(a.innerText||'').replace(/\n/g,' ').slice(0,60)});
+          }
+          return 'null';
+        })()"""
+        r = b.eval(js)
+        try:
+            picked = json.loads(r) if r and r != "null" else None
+        except Exception:
+            picked = None
+        if not picked:
+            return {"status": "error", "error": "抖音直播首页没找到可进入的直播间，稍后再试"}
+        b.navigate("https://live.douyin.com/" + picked["id"])
+    time.sleep(6)
+    # 换房间后清空去重记录，避免旧房间弹幕压住新房间
+    with _danmaku_lock:
+        _danmaku_seen.clear()
+    out = douyin_danmaku_read()
+    room = picked["title"] if picked else ""
+    if out.get("status") != "success":
+        return {"status": "success", "room": room or "已打开的直播间",
+                "new_count": 0, "new": [], "screen_count": 0,
+                "note": "直播间已打开，弹幕稍等几秒再读"}
+    out["room"] = out.get("room") or room or "直播间"
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 手机通道：与 Mac 平级的第二个设备后端。
 #
 # 数据契约对齐社区 xiaozhi-AutoGLM-mcp / Open-AutoGLM：
@@ -1731,6 +1831,13 @@ class Handler(BaseHTTPRequestHandler):
             if out.get("status") == "success":
                 return self._send(ok(out["result"]))
             return self._send(err(out.get("error", "读不到浏览器页面")))
+        if path == "/danmaku":
+            # 只读：当前直播间新增弹幕（去重状态在电脑端）
+            out = douyin_danmaku_read()
+            if out.get("status") == "success":
+                log("弹幕读取 → 新增 %d 条" % out.get("new_count", 0))
+                return self._send(ok(json.dumps(out, ensure_ascii=False)))
+            return self._send(err(out.get("error", "读取弹幕失败")))
         if path == "/music_state":
             apps = installed_apps()
             app = None
@@ -1976,6 +2083,28 @@ class Handler(BaseHTTPRequestHandler):
             if out.get("status") == "success":
                 return self._send(ok(out["result"]))
             return self._send(err(out.get("error", "手机操作失败")))
+        if path == "/danmaku":
+            # 打开抖音直播间（读弹幕走 GET /danmaku）。
+            # 同一句语音会同时触发设备端本地兜底和云端 MCP 工具，这里也去重。
+            text = (b.get("text") or "").strip()
+            url = (b.get("url") or "").strip()
+            bkey = "open|" + (url or text)
+            now = time.time()
+            with _lock:
+                dup = (bkey == _last_danmaku_open.get("key")
+                       and now - _last_danmaku_open.get("ts", 0) < 15)
+                if not dup:
+                    _last_danmaku_open.update(key=bkey, ts=now)
+            if dup:
+                return self._send(ok("刚才已经打开过这个直播间了，已跳过重复打开；"
+                                    "读新弹幕请直接调用 GET /danmaku（不带参数的"
+                                    " self.danmaku.web）。"))
+            out = douyin_danmaku_open(text=text, url=url)
+            log(f"打开抖音直播间 → {json.dumps(out, ensure_ascii=False)[:200]}")
+            record("danmaku_open", json.dumps(out, ensure_ascii=False)[:300])
+            if out.get("status") == "success":
+                return self._send(ok(json.dumps(out, ensure_ascii=False)))
+            return self._send(err(out.get("error", "打开抖音直播间失败")))
         if path == "/browser":
             # 复合指令：打开浏览器 → 搜索 → 按回车 → 读网页 → 点结果。
             # 固件只转发用户原话，句式解析、应用/网址都不写死在固件里。

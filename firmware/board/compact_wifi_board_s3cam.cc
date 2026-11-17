@@ -15,6 +15,7 @@
 #if MAC_CONTROL_ENABLE
 #include "mac_control_tools.h"
 #endif
+#include "danmaku_tools.h"
 #include "phone_bridge.h"
 #include "voice_selftest.h"
 
@@ -161,11 +162,15 @@ private:
         config.pin_reset = CAMERA_PIN_RESET;
         config.xclk_freq_hz = XCLK_FREQ_HZ;
         config.pixel_format = PIXFORMAT_RGB565;
-        config.frame_size = FRAMESIZE_VGA;
-        config.jpeg_quality = 12;
-        config.fb_count = 1;
+        // HD(1280x720)：为读屏幕弹幕小字提高分辨率（VGA 下 OCR 太糊）。
+        // RGB565 帧缓冲 1.8MB + 编码缓冲 1.8MB + 预览 1.8MB 都在 PSRAM，
+        // 8MB PSRAM 实测可承受；若出现 PSRAM 分配失败日志再降回 SVGA/VGA。
+        config.frame_size = FRAMESIZE_HD;
+        config.jpeg_quality = 10;
+        // OV3660 实测单缓冲+WHEN_EMPTY 取帧超时，改双缓冲+LATEST 再试
+        config.fb_count = 2;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        config.grab_mode = CAMERA_GRAB_LATEST;
         camera_ = new Esp32Camera(config);
     }
 
@@ -200,6 +205,9 @@ public:
         // 设备端 MCP 工具：走小智原生语音通道，云端大模型可直接调用控制这台 Mac
         StartMacControlTools();
 #endif
+        // 摄像头弹幕监听：self.danmaku.read / reset（不依赖 Portal，纯摄像头+云端视觉）
+        // 注意：构造期间不能调 Board::GetInstance()（死锁），所以把 camera_ 直接传进去
+        StartDanmakuTools(camera_);
         // ESP32 自托管手机接入：内置 APK 下载页 + 自动发现手机 :7333。
         // 发现手机后所有 self.* 工具自动切到固件直连，不再需要电脑。
         StartPhoneBridge();

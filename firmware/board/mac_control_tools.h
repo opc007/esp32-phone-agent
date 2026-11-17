@@ -8,6 +8,10 @@
 // 动作经 WiFi 发到这台 Mac 上常驻的 computer_portal.py (0.0.0.0:8080)。
 void StartMacControlTools();
 
+// 抖音直播弹幕（电脑端 CDP 浏览器读网页 DOM）。
+// arg 为空 = 读新增弹幕；非空 = JSON 体 {"text"/"url"} 打开直播间。
+std::string DanmakuWeb(const std::string& arg = "");
+
 // 串口自测命令。cmd 已小写，args 保留原始大小写（应用名区分大小写）。
 // 返回空字符串表示不是本模块的命令。
 std::string MacControlConsoleCommand(const std::string& cmd,

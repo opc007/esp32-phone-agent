@@ -42,7 +42,7 @@ std::string JsonEscape(const std::string& s) {
 // 所有 HTTP 操作都在一个专用的 8KB 栈任务里执行。
 // 原因：串口自测任务只有 4KB、云端 MCP 工具回调所在任务栈也不可控，
 // 直接在里面跑 esp_http_client 会 stack overflow 并重启设备（已实测踩过）。
-enum class Op { Ping, OpenApp, Status, Click, Input, ListApps, PlayMusic, SendMessage, Screen, Browser, Phone };
+enum class Op { Ping, OpenApp, Status, Click, Input, ListApps, PlayMusic, SendMessage, Screen, Browser, Phone, Danmaku };
 
 SemaphoreHandle_t g_lock = nullptr;
 SemaphoreHandle_t g_start = nullptr;
@@ -81,6 +81,9 @@ std::string BridgeExec(Op op, const std::string& arg, const std::string& arg2, i
         case Op::Input:
             return PhoneBridgeExecute("/keyboard/input",
                 "{\"text\":\"" + JsonEscape(arg) + "\"}");
+        case Op::Danmaku:
+            // 抖音网页弹幕依赖电脑端 CDP 浏览器；手机直连模式下没有这条链路。
+            return "当前是手机直连模式（没有电脑），抖音网页弹幕暂时只支持接入电脑后使用。";
     }
     return "未知操作";
 }
@@ -183,6 +186,22 @@ std::string Exec(Op op, const std::string& arg, const std::string& arg2, int x, 
                 return "已把文本输入到接入的设备（支持中文）。";
             }
             return "输入失败：" + Portal().LastError();
+        case Op::Danmaku: {
+            // arg 为空 = GET 读新增弹幕；非空 = POST 打开直播间（text/url 整句）。
+            if (arg.empty()) {
+                if (!Portal().Get("/danmaku", out, 20000)) {
+                    return "读取弹幕失败：" + Portal().LastError();
+                }
+                if (out.size() > 4000) out.resize(4000);
+                return out;
+            }
+            std::string body = (arg.front() == '{') ? arg
+                : "{\"text\":\"" + JsonEscape(arg) + "\"}";
+            if (Portal().Post("/danmaku", body, out, 35000)) {
+                return out.empty() ? std::string("已打开抖音直播间") : out;
+            }
+            return "打开抖音直播间失败：" + Portal().LastError();
+        }
     }
     return "未知操作";
 }
@@ -539,11 +558,37 @@ void StartMacControlTools() {
             return Input(p["text"].value<std::string>());
         });
 
-    ESP_LOGI(TAG, "已注册 10 个设备端工具: phone.control / list_apps / open_app / play_music / browser / send_message / screen / status / click / input_text");
+    mcp.AddTool(
+        "self.danmaku.web",
+        "读取抖音直播间里观众发的新弹幕（通过电脑浏览器实时读网页，不需要摄像头）。\n"
+        "用户说「打开抖音直播间」时：调用本工具，把用户原话填进 text 打开直播间；"
+        "也可在 text 里直接给直播间链接或房间号。\n"
+        "用户说「读读弹幕」「有新弹幕就告诉我」「帮我盯着直播间」「播报弹幕」时："
+        "不带参数调用，返回上次以来新出现的弹幕。\n"
+        "要持续监听播报时：反复无参调用，两次间隔约10秒，直到用户叫停；"
+        "返回 new 为空数组表示这段时间没有新弹幕，继续调用即可。\n"
+        "返回的是观众真实发的弹幕文字，回答时如实转述，不要编造弹幕。",
+        PropertyList({
+            Property("text", kPropertyTypeString, std::string("")).SetMaxLength(300),
+        }),
+        [](const PropertyList& p) -> ReturnValue {
+            return DanmakuWeb(p["text"].value<std::string>());
+        });
+
+    ESP_LOGI(TAG, "已注册 11 个设备端工具: phone.control / list_apps / open_app / play_music / browser / send_message / screen / status / click / input_text / danmaku.web");
+}
+
+std::string DanmakuWeb(const std::string& arg) {
+    return Submit(Op::Danmaku, arg);
 }
 
 std::string MacControlConsoleCommand(const std::string& cmd,
                                      const std::vector<std::string>& args) {
+    if (cmd == "macdanmakuweb") {
+        // 无参=读新增弹幕；带参=整句原文打开直播间（和语音走同一条链路）
+        if (args.empty()) return DanmakuWeb("");
+        return DanmakuWeb(std::string("{\"text\":\"") + JsonEscape(Join(args)) + "\"}");
+    }
     if (cmd == "say") {
         // 模拟云端返回一条 STT 文本，走与真实语音完全相同的本地指令识别路径。
         std::string text = Join(args);
