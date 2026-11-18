@@ -21,6 +21,10 @@ tools/platform-tools*
 tools/e2e_work/
 e2e_work/
 
+# 七宝 S31 构建缓存
+build_s31/
+build_b/
+
 # OS noise
 crash_log.txt
 evidence-*.png
