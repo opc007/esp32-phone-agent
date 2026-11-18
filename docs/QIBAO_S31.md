@@ -25,7 +25,10 @@ ESP32-S31-Korvo-1（乐鑫官方开发板）：
 - **刷脸门禁**：摄像头抓帧 → ESP-DL 人脸检测+512 维特征提取 → 与主人特征点积比对（阈值 0.55）。
   刷脸成功解锁 10 分钟；期间所有控制指令放行。未录入人脸时降级放行（不会把自己锁在外面）。
   识别到主人喊「岗哥」并甜甜打招呼，陌生人回「你是谁呀，七宝不认识你」。
-- **七宝形象**：LCD 上显示形象图 + 呼吸缩放 + 上下浮动 LVGL 动画（待机也像活的）。
+- **七宝形象**：LCD 上显示**完整全身图**（站姿/坐姿，头到脚完整、保持比例不变形），
+  屏幕背景设为与原图一致的米灰渐变使两侧无缝融合；两张图约 9 秒一轮**柔和淡入淡出**
+  循环（类似一段循环短视频）。已去掉早先难看的呼吸缩放 + 上下浮动抖动。
+  图片以压缩 JPG 编进固件（约 75KB），启动时用 `jpeg_to_image_fit` 解码到 16MB PSRAM。
 - **自定义唤醒词**：`qi bao mei mei`（显示名「七宝妹妹」，MultiNet7 quant 模型）。
 - **控制电脑**：复用主线的设备端 MCP 工具，走 WiFi → Mac 上 `computer_portal.py:8080`，
   应用名单动态从 Portal 端读，固件不存 App 表。11 个 `self.mac.*` 工具 + `self.qibao.face`。
@@ -52,13 +55,21 @@ espressif/human_face_recognition:{ version: "0.3.2", rules: [{ if: "target in [e
 编译脚本 `tools/build_s31_qibao.sh`（独立 `build_s31` 目录，板型锁 `KORVO_1`，
 分区表 `16m_qibao.csv`，唤醒词配置见 `firmware/qibao_s31/sdkconfig.defaults.esp32s31`）。
 
-形象图头文件 `qibao_avatar.h` 由 `tools/jpg2lvgl.py` 从图片生成（macOS `sips` 转 BMP + Python 标准库，
-无需 PIL）。换形象图：
+形象图资源头文件 `qibao_frames.h` 由 `tools/jpg2c.py` 把原始 JPG 字节转成 C 数组
+（不做解码，固件运行时解码到 PSRAM）。换形象图：先用 `sips` 把完整全身图等比缩到
+540×960、JPG 质量 55（每张约 30~45KB），再逐个转成数组：
 
 ```bash
-python3 tools/jpg2lvgl.py tools/qibao_assets/qibao_face480.jpg \
-  <工程>/main/boards/espressif/esp32-s31-korvo-1/qibao_avatar.h qibao_avatar 360
+sips -z 960 540 qibao_standing.jpg --out /tmp/qb_frame0.jpg -s format jpeg -s formatOptions 55
+sips -z 960 540 qibao_seated.jpg   --out /tmp/qb_frame1.jpg -s format jpeg -s formatOptions 55
+python3 tools/jpg2c.py /tmp/qb_frame0.jpg \
+  <工程>/main/boards/espressif/esp32-s31-korvo-1/qibao_frames.h qibao_frame_0_jpg
+# 第二张追加进同一头文件（数组名 qibao_frame_1_jpg）
 ```
+
+`qibao_display.h` 用 `jpg/jpeg_to_image.h` 的 `jpeg_to_image_fit(jpg, len, 800, 480, ...)`
+解码，输出约 264×480（按 1080:1920 比例、高度铺满），居中显示。
+旧的 `qibao_avatar.h`（360×360 RGB565）已废弃，不再被引用。
 
 ## 烧录
 
@@ -79,9 +90,10 @@ bash prebuilt/qibao_s31/flash.sh /dev/cu.usbserial-2110 460800
 - `SKU=esp32-s31-korvo-1`，`Es8389AudioCodec initialized`
 - `QibaoSD: TF 卡挂载成功：USD00（400 kHz, 4-bit）` + `读写自检：通过（写 11 / 读 11 字节）`
 - `七宝人脸模块就绪，特征维度 512，已录入=0`，`self.qibao.face` 工具已注册
-- `QibaoDisplay: 七宝形象图已显示（360x360）+ 呼吸/浮动动画`
+- `QibaoDisplay: frame0/frame1 解码 OK: 264x480 stride=528`（两张完整全身图解码到 PSRAM）
+- `QibaoDisplay: 七宝完整全身图 x2 已显示 + 淡入淡出循环（无抖动）`
 - 全局 23 个 MCP 工具注册，11 个 `self.mac.*` 控制工具
-- 固件 7.5MB（含 1.5MB 人脸模型），app 分区剩 4%
+- 固件 7.3MB（含 1.5MB 人脸模型 + 75KB 形象图 JPG），app 分区剩 6%
 
 ## 待办 / 需用户本人操作
 
