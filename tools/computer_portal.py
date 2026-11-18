@@ -650,6 +650,157 @@ def ensure_front(pid):
 
 
 # ---------------------------------------------------------------------------
+# 应用内搜索：打开 App 后把搜索词填进它自己的搜索框（AX + 键盘注入）。
+# 已实测结论（2026-11-18，抖音 Mac 版）：
+#   · Chromium/Electron 壳的 App 必须先设 AXManualAccessibility 才暴露网页内容；
+#   · 搜索框不进静态控件树，只能用 Tab 键导航走到（焦点路径会读到）；
+#   · 合成回车/按钮 AXPress 大多不触发提交（App 过滤不可信事件），
+#     所以自动提交是「尽力而为」，失败时如实说明要用户手动按回车。
+# ---------------------------------------------------------------------------
+def _cg_key(keycode, shift=False, delay=0.3):
+    for down in (True, False):
+        ev = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
+        if shift:
+            Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskShift)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    time.sleep(delay)
+
+
+def _cg_type(text):
+    for ch in text:
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+            Quartz.CGEventKeyboardSetUnicodeString(ev, 1, ch)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+        time.sleep(0.06)
+
+
+def _focused(el):
+    try:
+        fe = el.attr("AXFocusedUIElement")
+        return fe if isinstance(fe, ax_ui.AXElement) else None
+    except Exception:
+        return None
+
+
+def _dismiss_login_modal(el):
+    """关掉居中弹窗（登录框等）：弹窗区域里没有文字的可按元素通常是右上角关闭钮。"""
+    try:
+        tree = ax_ui.Tree(el.snapshot(12, 1600))
+        cands = [n for n in tree.nodes()
+                 if n.get("_el") and "AXPress" in n["_el"].actions()
+                 and isinstance(n.get("pos"), list)
+                 and not (n.get("title") or n.get("desc") or n.get("value"))
+                 and n["pos"][0] > 500 and 200 < n["pos"][1] < 900]
+        if not cands:
+            return False
+        cands.sort(key=lambda n: -(n["pos"][0] - n["pos"][1]))
+        cands[0]["_el"].press("AXPress")
+        time.sleep(1.2)
+        return True
+    except Exception:
+        return False
+
+
+def _is_text_field(fe):
+    if not isinstance(fe, ax_ui.AXElement):
+        return False
+    try:
+        role = fe.attr("AXRole") or ""
+        ph = fe.attr("AXPlaceholderValue") or ""
+    except Exception:
+        return False
+    # 只要「搜索」框：登录弹窗的手机号框也是 AXTextField，别误认
+    return role == "AXSearchField" or "搜索" in ph
+
+
+def app_in_app_search(pid, name, query):
+    """在已打开的 App 里搜索。返回给模型看的中文结果（如实报告每步成败）。"""
+    el = ax_ui.app_element(int(pid))
+    if not el:
+        return f"{name} 进程没找到，无法搜索。"
+    # ① 解锁 Chromium 系 App 的网页无障碍（原生 App 无此概念，设了也无害）
+    try:
+        el.set("AXManualAccessibility", True)
+    except Exception:
+        pass
+    if not ensure_front(pid):
+        return f"没法把 {name} 调到前台，搜索中止。"
+    time.sleep(0.8)
+    _dismiss_login_modal(el)
+
+    # ② Tab 键导航到搜索框。注意：登录弹窗的手机号框也是 AXTextField，
+    #    必须只认占位符含「搜索」的框，并在弹窗内继续走（弹窗一般占前 10 步左右）。
+    field = None
+    for i in range(34):
+        _cg_key(48)  # Tab
+        fe = _focused(el)
+        if fe is None:
+            continue
+        try:
+            role = fe.attr("AXRole") or ""
+            ph = fe.attr("AXPlaceholderValue") or ""
+        except Exception:
+            continue
+        if role == "AXSearchField" or "搜索" in ph:
+            field = fe
+            break
+    if field is None:
+        return (f"{name} 已打开并调到前台，但在界面上没找到可自动操作的搜索框。"
+                f"请如实告诉用户：请自己点一下 {name} 的搜索框。")
+    time.sleep(0.4)
+
+    # ③ 注入搜索词。弹窗常在中途弹回抢走键盘焦点，所以每轮：确认焦点还在搜索框
+    #    → 打字 → 读回校验；失败就再关一次弹窗、重新 Tab 到搜索框再打。
+    filled = False
+    for attempt in range(3):
+        fe = _focused(el)
+        if not _is_text_field(fe):
+            _dismiss_login_modal(el)
+            time.sleep(0.5)
+            for _ in range(14):
+                _cg_key(48)
+                fe = _focused(el)
+                if _is_text_field(fe):
+                    field = fe
+                    break
+            else:
+                continue
+            time.sleep(0.4)
+        _cg_type(query)
+        time.sleep(0.8)
+        try:
+            val = str(field.attr("AXValue") or "")
+        except Exception:
+            val = ""
+        if query[:4] in val:
+            filled = True
+            break
+    # ④ 提交（尽力而为）：回车两次（第二次防首次被吃掉）
+    _cg_key(36, delay=0.15)
+    _cg_key(36, delay=3.0)
+
+    # ⑤ 回读状态，如实报告
+    page = ""
+    try:
+        tree = ax_ui.Tree(el.snapshot(8, 500))
+        for n in tree.nodes():
+            if n.get("role") == "AXWebArea" and n.get("title"):
+                page = n.get("title")
+                break
+    except Exception:
+        pass
+    note_target(pid, name)
+    if filled:
+        return (f"已打开{name}，并把「{query}」填进了它的搜索框（已尝试自动回车提交）。"
+                f"当前页面：{page[:40] or name}。"
+                f"如果屏幕上还没出搜索结果，请按一下回车键；结果出来后可以让我读屏幕。")
+    return (f"{name} 已打开并找到了搜索框，但自动填入「{query}」没有生效"
+            f"（{name} 的搜索框对自动键盘输入不稳定）。请如实告诉用户："
+            f"搜索词是「{query}」，请自己在{name}里输入并搜索。")
+
+
+# ---------------------------------------------------------------------------
 # 「打开微信给张三发消息说明天见」这类复合语音指令的解析。
 # 放在电脑端做：Python 正则好改，固件里不写死任何联系人 / 应用 / 句式。
 # 云端模型如果已经给出结构化 app/contact/message，就直接用，不经这里。
@@ -1958,6 +2109,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(ok())
         if path == "/app":
             pkg = b.get("package", "")
+            search_q = (b.get("search") or "").strip()
             app, apps = resolve_app(pkg)
             if app is None:
                 # 自动路由：这台 Mac 没装、但接了手机，就直接从手机桌面动态找到并打开。
@@ -2002,6 +2154,16 @@ class Handler(BaseHTTPRequestHandler):
                 pid2, _ = find_app_pid(app["bundle_id"], app["name"])
                 if pid2:
                     note_target(pid2, app["name"])
+                if search_q and pid2:
+                    # 应用内搜索：打开 App 后把词填进它自己的搜索框（如实报告）
+                    try:
+                        msg = app_in_app_search(pid2, app["name"], search_q)
+                    except Exception as e:
+                        msg = (f"已打开「{app['name']}」，但应用内搜索出错：{e}。"
+                               f"请如实告诉用户搜索词是「{search_q}」，请自己手动搜索。")
+                    log("  → " + msg[:200])
+                    record("app_search", msg[:240])
+                    return self._send(ok(msg[:2200]))
                 return self._send(ok(f"已在这台 Mac 电脑上打开应用「{app['name']}」。"))
             return self._send(err(detail))
         if path == "/play_music":

@@ -101,8 +101,14 @@ std::string Exec(Op op, const std::string& arg, const std::string& arg2, int x, 
         case Op::OpenApp: {
             // 关键：固件里没有任何 App 名单，只把用户/模型说的名字原样发过去，
             // 由Portal 端从「真实安装列表」动态解析；找不到时错误里会带回可用应用列表。
-            std::string body = "{\"package\":\"" + JsonEscape(arg) + "\"}";
-            if (Portal().Post("/app", body, out, 10000)) {
+            // arg2 非空 = 应用内搜索词：打开 App 后把词填进它自己的搜索框（耗时较长）。
+            std::string body = "{\"package\":\"" + JsonEscape(arg) + "\"";
+            if (!arg2.empty()) {
+                body += ",\"search\":\"" + JsonEscape(arg2) + "\"";
+            }
+            body += "}";
+            int timeout = arg2.empty() ? 10000 : 60000;
+            if (Portal().Post("/app", body, out, timeout)) {
                 return out.empty() ? std::string("已打开应用「") + arg + "」" : out;
             }
             return Portal().LastError();
@@ -225,7 +231,7 @@ void InitWorker() {
 }
 
 std::string Submit(Op op, const std::string& arg = "", const std::string& arg2 = "",
-                   int x = 0, int y = 0) {
+                   int x = 0, int y = 0, int wait_ms = 30000) {
     InitWorker();
     if (xSemaphoreTake(g_lock, pdMS_TO_TICKS(30000)) != pdTRUE) {
         return "控制通道忙，请稍后再试";
@@ -237,8 +243,8 @@ std::string Submit(Op op, const std::string& arg = "", const std::string& arg2 =
     g_y = y;
     g_result.clear();
     xSemaphoreGive(g_start);
-    bool ok = xSemaphoreTake(g_done, pdMS_TO_TICKS(30000)) == pdTRUE;
-    std::string r = ok ? g_result : "控制设备超时（HTTP 未在 30 秒内返回）";
+    bool ok = xSemaphoreTake(g_done, pdMS_TO_TICKS(wait_ms)) == pdTRUE;
+    std::string r = ok ? g_result : "控制设备超时（HTTP 未在限定时间内返回）";
     if (!ok) {
         // 清掉可能迟到的完成信号，避免影响下一次调用
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -248,9 +254,10 @@ std::string Submit(Op op, const std::string& arg = "", const std::string& arg2 =
     return r;
 }
 
-std::string OpenApp(const std::string& app) {
+std::string OpenApp(const std::string& app, const std::string& search = "") {
     if (app.empty()) return "应用名不能为空";
-    return Submit(Op::OpenApp, app);
+    // 应用内搜索要经过 Tab 导航+注入+回读，电脑端最多 60 秒，等 70 秒留余量
+    return Submit(Op::OpenApp, app, search, 0, 0, search.empty() ? 30000 : 70000);
 }
 
 std::string ListApps() {
@@ -433,13 +440,18 @@ void StartMacControlTools() {
         "不要回答自己没有能力控制设备。\n"
         "重要：app_name 直接填用户说的名字，中文或英文都行，例如「抖音」「QQ音乐」「计算器」"
         "「Safari」「微信」；Portal 端会从真实安装列表里动态解析，固件里没有写死任何应用名。\n"
+        "想在某应用里搜索内容时（如「打开抖音搜索三亚旅游」「在B站搜X」「打开QQ音乐搜周杰伦」），"
+        "也调用本工具：app_name 填应用名，search 填搜索词，电脑会打开该应用并把词填进它自己的搜索框。"
+        "绝不要因为用户说了「搜索」就改用浏览器工具——只有用户明确说「浏览器/网页」才用浏览器。\n"
         "拿不准就先调用 self.mac.list_apps。如果这个名字不存在，本工具会返回真实可用的应用列表，"
         "请从列表里选一个正确的名字重新调用，不要直接说打不开。",
         PropertyList({
             Property("app_name", kPropertyTypeString),
+            Property("search", kPropertyTypeString, std::string("")).SetMaxLength(120),
         }),
         [](const PropertyList& p) -> ReturnValue {
-            return OpenApp(p["app_name"].value<std::string>());
+            return OpenApp(p["app_name"].value<std::string>(),
+                           p["search"].value<std::string>());
         });
 
     mcp.AddTool(
@@ -491,10 +503,12 @@ void StartMacControlTools() {
         "self.mac.browser",
         "控制接入的设备上的浏览器：打开浏览器、在搜索框里输入中文、真实按下回车搜索、"
         "读回网页上真实显示的文字、点击搜索结果或网页按钮（如播放、登录、下一页）。\n"
-        "用户说「打开浏览器」「打开浏览器然后搜索 X」「帮我搜一下 X」「查一下 X」"
-        "「按回车」「敲回车」「点第一个结果」「点第 2 条链接」「点播放」"
-        "「读一下网页上写了什么」「网页上有什么」「返回上一页」「打开某个网址」时，"
-        "都必须调用本工具。\n"
+        "只用浏览器的场景：用户明确说「浏览器」「网页」「打开某个网址」，或要查公开网上资料"
+        "且没有指定任何应用（如「查一下今天天气」）。\n"
+        "禁止场景：用户想在某个应用里看或搜内容时（如「打开抖音搜索X」「在B站搜X」"
+        "「微信里搜小程序」），绝不能调用本工具，改用 self.mac.open_app 并填 search 参数。\n"
+        "用户说「打开浏览器然后搜索 X」「帮我搜一下 X」「按回车」「点第一个结果」「点播放」"
+        "「读一下网页上写了什么」「返回上一页」时调用本工具。\n"
         "极其重要：你实际控制着一台真实设备上的浏览器，能输入、能按回车、能读到网页内容。"
         "绝对不要回答「我无法操作浏览器」「我没有联网」「请自己手动搜索」「我做不到」。\n"
         "用法：把用户的原话整句填进 text，Portal 端会自动解析中文口语句式；"
@@ -620,8 +634,13 @@ std::string MacControlConsoleCommand(const std::string& cmd,
         return ListApps();
     }
     if (cmd == "macapp") {
-        if (args.empty()) return "用法: macapp <应用名（中文或英文）>，例如 macapp 抖音";
-        return OpenApp(args[0]);
+        if (args.empty()) return "用法: macapp <应用名> [搜索词]，例如 macapp 抖音 或 macapp 抖音 三亚旅游攻略";
+        std::string q;
+        for (size_t i = 1; i < args.size(); i++) {
+            if (i > 1) q += " ";
+            q += args[i];
+        }
+        return OpenApp(args[0], q);
     }
     if (cmd == "macplay") {
         if (args.empty()) return "用法: macplay <歌曲名>，例如 macplay 世上只有妈妈好";
