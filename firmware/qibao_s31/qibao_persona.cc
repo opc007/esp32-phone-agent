@@ -35,8 +35,10 @@
 
 #include "board.h"
 #include "esp_video.h"
+#include "jpg/image_to_jpeg.h"
 #include "jpg/jpeg_to_image.h"
 #include "qibao_owner_ref.h"  // 岗哥本人照片裁出的两帧（设备端解码后提特征）
+#include "qibao_screen.h"    // 当前屏幕方向（摄像头帧要跟着去旋转）
 
 static const char* TAG = "Qibao";
 
@@ -215,6 +217,49 @@ uint8_t* decode_jpeg_tight(const uint8_t* jpeg, size_t jpeg_len, int* out_w, int
     return tight;
 }
 
+// 把一段 RGB565 图像顺时针转 angle 度（0/90/180/270），输出紧密排列的新缓冲。
+// 90/270 度时宽高互换（320x240 -> 240x320）。
+// 返回新分配的缓冲（调用方释放），nullptr 表示失败。
+//
+// 【为什么要转】屏幕方向变了，说明设备被转了 90°/180°，那摄像头拍到的画面
+// 在设备坐标系里也跟着转了 —— 人脸就是躺着的。人脸检测模型只认正脸，
+// 不转的话根本检不出来（表现就是「转成竖屏以后刷脸一直失败」）。
+// 转完之后画面里的「上」和竖屏界面的「上」一致，也和岗哥照片的「上」一致，
+// 特征才对得上。
+uint8_t* rotate_rgb565_cw(const uint8_t* src, int w, int h, int angle, int* out_w, int* out_h) {
+    if (w <= 0 || h <= 0) {
+        return nullptr;
+    }
+    const int ow = (angle == 180) ? w : h;
+    const int oh = (angle == 180) ? h : w;
+    uint8_t* out = (uint8_t*)heap_caps_malloc((size_t)ow * oh * 2,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (out == nullptr) {
+        return nullptr;
+    }
+    for (int y = 0; y < oh; ++y) {
+        for (int x = 0; x < ow; ++x) {
+            int sx = 0, sy = 0;
+            if (angle == 90) {
+                // 顺时针 90°：dst(x,y) = src(y, h-1-x)
+                sx = y;
+                sy = h - 1 - x;
+            } else if (angle == 180) {
+                // dst(x,y) = src(w-1-x, h-1-y)
+                sx = w - 1 - x;
+                sy = h - 1 - y;
+            } else {  // 270（= 逆时针 90°）：dst(x,y) = src(w-1-y, x)
+                sx = w - 1 - y;
+                sy = x;
+            }
+            std::memcpy(out + ((size_t)y * ow + x) * 2, src + ((size_t)sy * w + sx) * 2, 2);
+        }
+    }
+    *out_w = ow;
+    *out_h = oh;
+    return out;
+}
+
 // 抓一帧摄像头 JPEG 并解码成紧密 RGB565LE，返回缓冲（调用方释放）
 uint8_t* capture_rgb565(int* out_w, int* out_h) {
     Camera* cam = Board::GetInstance().GetCamera();
@@ -236,7 +281,28 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
     }
     ESP_LOGI(TAG, "Captured JPEG: %u bytes, %ux%u", (unsigned)jpeg_len,
              video->GetFrameWidth(), video->GetFrameHeight());
-    return decode_jpeg_tight(jpeg, jpeg_len, out_w, out_h);
+
+    uint8_t* rgb = decode_jpeg_tight(jpeg, jpeg_len, out_w, out_h);
+    if (rgb == nullptr) {
+        return nullptr;
+    }
+
+    // 按当前屏幕方向去旋转，让画面里的「上」和界面、照片一致
+    const int angle = qibao::CurrentAngleDeg();
+    if (angle != 0) {
+        int rw = 0, rh = 0;
+        uint8_t* rot = rotate_rgb565_cw(rgb, *out_w, *out_h, angle, &rw, &rh);
+        heap_caps_free(rgb);
+        if (rot == nullptr) {
+            ESP_LOGE(TAG, "Frame rotate failed");
+            return nullptr;
+        }
+        ESP_LOGI(TAG, "Frame de-rotated %d° -> %dx%d", angle, rw, rh);
+        rgb = rot;
+        *out_w = rw;
+        *out_h = rh;
+    }
+    return rgb;
 }
 
 // 用最大的人脸关键点提特征，返回新分配的特征数组（调用方释放）
@@ -527,6 +593,33 @@ std::string StatusJson() {
              (unsigned)UnlockRemainingMs(), g_last_similarity,
              qibao_sd::Available() ? "true" : "false");
     return std::string(buf);
+}
+
+bool CaptureCameraJpeg(std::string& jpeg, int quality) {
+    int w = 0, h = 0;
+    // capture_rgb565 内部已经按当前屏幕方向去旋转过了
+    uint8_t* rgb = capture_rgb565(&w, &h);
+    if (rgb == nullptr) {
+        return false;
+    }
+    jpeg.clear();
+    // 摄像头帧和解码器出来的都是原小端 RGB565，跟 LVGL 缓冲一致，
+    // 所以这里**不要**再 bswap（多换一次颜色会整个错掉）。
+    bool ret = image_to_jpeg_cb(
+        rgb, (size_t)w * h * 2, (uint16_t)w, (uint16_t)h, V4L2_PIX_FMT_RGB565, quality,
+        [](void* arg, size_t index, const void* data, size_t len) -> size_t {
+            std::string* output = static_cast<std::string*>(arg);
+            if (data && len > 0) {
+                output->append(static_cast<const char*>(data), len);
+            }
+            return len;
+        },
+        &jpeg);
+    heap_caps_free(rgb);
+    if (!ret) {
+        ESP_LOGE(TAG, "摄像头帧 JPEG 编码失败");
+    }
+    return ret;
 }
 
 // ---- 异步刷脸（唤醒时触发，不阻塞语音通道） ----

@@ -6,7 +6,8 @@
  *
  *   help                     命令列表
  *   state                    当前设备状态
- *   qrotate                  画面翻转 180°（和板载长按 MODE、屏幕按钮等效）
+ *   qrotate                  画面转 90°（0→90→180→270→0，和板载长按 MODE、屏幕按钮等效）
+ *   qrot <0|90|180|270>      直接指定屏幕方向
  *   qpose                    站姿 / 坐姿 手动切换
  *   qstatus                  人脸门禁 + 屏幕方向 状态
  *   wifiset <ssid> <密码>    写入 WiFi 凭据并重启（重启后自动连上）
@@ -16,6 +17,7 @@
 #include "qibao_console.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -119,7 +121,8 @@ void Run(const std::string& raw) {
     ESP_LOGI(TAG, "[CMD] > %s", raw.c_str());
 
     if (cmd == "help" || cmd == "?") {
-        ESP_LOGI(TAG, "[CMD] < help | state | qrotate(翻转画面) | qpose(换姿势) | qstatus | "
+        ESP_LOGI(TAG, "[CMD] < help | state | qrotate(转 90°) | qrot <0|90|180|270> | "
+                      "qpose(换姿势) | qstatus | qprobe | qdiag | qshot | qcam | "
                       "wifiset <ssid> <密码> | wifilist | macphone <整句> | macapps | macscreen");
         return;
     }
@@ -131,6 +134,30 @@ void Run(const std::string& raw) {
 #if MAC_CONTROL_ENABLE
     if (cmd == "qrotate") {
         ESP_LOGI(TAG, "[CMD] < %s", qibao::ToggleRotation().c_str());
+        return;
+    }
+    if (cmd == "qrot") {
+        // 直接指定角度：qrot 0 / 90 / 180 / 270
+        if (args.empty()) {
+            ESP_LOGI(TAG, "[CMD] < 当前 %s，用法: qrot <0|90|180|270>", qibao::RotationName().c_str());
+            return;
+        }
+        const int deg = atoi(args[0].c_str());
+        qibao::Rotation target;
+        switch (deg) {
+            case 0:   target = qibao::Rotation::kNormal; break;
+            case 90:  target = qibao::Rotation::kPortrait; break;
+            case 180: target = qibao::Rotation::kUpsideDown; break;
+            case 270: target = qibao::Rotation::kPortraitAlt; break;
+            default:
+                ESP_LOGI(TAG, "[CMD] < 角度只能是 0 / 90 / 180 / 270");
+                return;
+        }
+        if (qibao::SetRotation(target)) {
+            ESP_LOGI(TAG, "[CMD] < %s", qibao::RotationName().c_str());
+        } else {
+            ESP_LOGI(TAG, "[CMD] < 设置失败（显示还没初始化？）");
+        }
         return;
     }
     if (cmd == "qpose") {
@@ -176,6 +203,18 @@ void Run(const std::string& raw) {
         ESP_LOGI(TAG, "[SHOT] BEGIN %u", (unsigned)jpeg.size());
         PrintBase64(jpeg);
         ESP_LOGI(TAG, "[SHOT] END");
+        return;
+    }
+    if (cmd == "qcam") {
+        // 抓一帧摄像头画面（已按当前屏幕方向去旋转），用来核对人脸方向对不对
+        std::string jpeg;
+        if (!qibao::CaptureCameraJpeg(jpeg, 75)) {
+            ESP_LOGI(TAG, "[CMD] < 摄像头抓帧失败");
+            return;
+        }
+        ESP_LOGI(TAG, "[CAM] BEGIN %u", (unsigned)jpeg.size());
+        PrintBase64(jpeg);
+        ESP_LOGI(TAG, "[CAM] END");
         return;
     }
 #endif

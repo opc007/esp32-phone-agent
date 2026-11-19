@@ -1,14 +1,31 @@
 #pragma once
 
-// 七宝妹妹形象显示：继承 RgbLcdDisplay，在 SetupUI 后叠加完整全身形象图。
+// 七宝妹妹形象显示：继承 RgbLcdDisplay，支持 0°/90°/180°/270° 四挡屏幕方向。
 //
 // 设计要点（按用户要求）：
 //   - 用完整的全身图（站姿 qibao_standing / 坐姿 qibao_seated），头到脚完整保留，绝不裁切；
 //   - 保持原比例（不拉伸变形），高度铺满屏幕，居中显示；
 //   - 屏幕背景设成与原图一致的米灰渐变，左右留白自然融合，看起来像一整张铺满的图；
-//   - 图片以压缩 JPG 编进固件（省 flash），启动时解码到 16MB PSRAM；
+//   - 图片以压缩 JPG 编进固件（省 flash），启动时解码到 PSRAM；
 //   - **不再自动轮播**：改成手动切换 —— 点一下图片就在站姿/坐姿之间柔和淡入淡出；
-//   - 左下角有一个旋转按钮，点一下把整个画面翻转 180°（这块板没有加速度计，只能手动）。
+//   - 左下角有一个旋转按钮，点一下转 90°（这块板没有加速度计，只能手动）。
+//
+// ---------------------------------------------------------------------------
+// 四挡方向是怎么做的（核心原理见 qibao_screen.h 的注释）
+//
+// 物理屏是 800x480 横屏。为了能「竖屏看内容」，做法是：
+//   - 把整套界面塞进一个「布局根容器」；
+//   - 横屏挡（0°/180°）：容器 800x480，正好铺满屏幕；
+//   - 竖屏挡（90°/270°）：容器 480x800，绕屏幕中心转 90° 后正好铺满 800x480；
+//   - 对容器做 lv_obj_set_style_transform_rotation()。
+//
+// 为什么不用「显示级旋转」（lv_display_set_rotation）：esp_lvgl_port 的触摸代码
+// 不支持显示级旋转，旋转后触摸全错位；容器级变换的触摸逆变换是 LVGL 自带的，
+// 实测「点哪就是哪」，局部刷新（聊天文字更新）也落在正确位置。
+//
+// 横屏挡和竖屏挡的布局尺寸不同，所以换挡时要**重建界面**：
+// 人物图的解码结果按朝向分别缓存（横屏一套、竖屏一套），
+// 重建时直接复用，不重新解码（每张 720KB，解码要几百毫秒）。
 
 #include "display/lcd_display.h"
 #include "qibao_frames.h"
@@ -18,6 +35,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <lvgl.h>
 
 #include "jpg/image_to_jpeg.h"
@@ -25,74 +43,83 @@
 
 class QibaoLcdDisplay : public RgbLcdDisplay {
 public:
+    // 物理屏尺寸（横屏）
+    static constexpr int kScreenW = 800;
+    static constexpr int kScreenH = 480;
+    // 竖屏布局尺寸
+    static constexpr int kPortraitW = 480;
+    static constexpr int kPortraitH = 800;
+
     QibaoLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
                     int width, int height, int offset_x, int offset_y,
                     bool mirror_x, bool mirror_y, bool swap_xy)
         : RgbLcdDisplay(panel_io, panel, width, height, offset_x, offset_y,
-                        mirror_x, mirror_y, swap_xy) {}
+                        mirror_x, mirror_y, swap_xy) {
+        // 方向一变（横屏 <-> 竖屏）就重建界面
+        qibao::SetRotationChangedCallback(OnRotationChanged);
+    }
 
     void SetupUI() override {
-        RgbLcdDisplay::SetupUI();  // 先建好小智原生 UI（状态栏/字幕/表情区）
+        // 防止重复建（RebuildUI 之前会把 setup_ui_called_ 清掉）
+        if (setup_ui_called_) {
+            ESP_LOGW(TAG, "SetupUI() 重复调用，跳过");
+            return;
+        }
         s_instance_ = this;
 
         DisplayLockGuard lock(this);
-        auto screen = lv_screen_active();
 
-        // 屏幕背景设成与原图一致的米灰渐变（顶 #81796D -> 底 #CBC3B7），
-        // 这样全身图两侧的留白和图片背景无缝融合，看起来像一整张铺满的图。
-        lv_obj_set_style_bg_color(screen, lv_color_hex(0x81796D), 0);
-        lv_obj_set_style_bg_grad_color(screen, lv_color_hex(0xCBC3B7), 0);
-        lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
-        lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+        EnsureLayoutRoot();                // 按当前方向建/复用布局根容器
+        SetLayoutRoot(layout_root_, root_w_, root_h_);
 
-        // 小智原生的 container_ 是整屏不透明白底，会把上面的渐变盖掉，
-        // 两侧就变成两条白边。这里把它改成透明，渐变露出来。
-        if (container_ != nullptr) {
-            lv_obj_set_style_bg_opa(container_, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(container_, 0, 0);
+        RgbLcdDisplay::SetupUI();          // 先建好小智原生 UI（状态栏/字幕/表情区）
+
+        ApplyBackdrop();                   // 米灰渐变背景 + 让原生容器透明
+        CreatePersonaImages();             // 人物图（解码结果按朝向缓存，不重复解码）
+        CreateRotateButton();              // 左下角旋转按钮
+
+        // 【关键】界面建完了，现在才能安全地套上旋转变换。
+        // 原因见 qibao_screen.h 的说明 6：界面没建就设 transform，
+        // 后面各个控件的小范围刷新会按「没翻转」的坐标把内容画回去。
+        ApplyRootTransform();
+        qibao::ScheduleFullRedraw();       // DIRECT 双缓冲：连补几次整屏重画
+    }
+
+    // ---------------------------------------------------------------------------
+    // 方向变化处理（在 LVGL 线程里被调用）
+    // ---------------------------------------------------------------------------
+    static void OnRotationChanged(qibao::Rotation rotation) {
+        auto* self = s_instance_;
+        if (self == nullptr) {
+            return;
         }
+        self->ApplyRotation(rotation);
+    }
 
-        // 解码两张完整全身图到 PSRAM。
-        bool ok0 = DecodeFrame(qibao_frame_0_jpg, sizeof(qibao_frame_0_jpg), &dsc0_, 0);
-        bool ok1 = DecodeFrame(qibao_frame_1_jpg, sizeof(qibao_frame_1_jpg), &dsc1_, 1);
-        if (!ok0 && !ok1) {
-            ESP_LOGE(TAG, "两张形象图都解码失败，跳过叠加");
+    void ApplyRotation(qibao::Rotation rotation) {
+        DisplayLockGuard lock(this);
+        const bool portrait = (rotation == qibao::Rotation::kPortrait ||
+                               rotation == qibao::Rotation::kPortraitAlt);
+        const int nw = portrait ? kPortraitW : kScreenW;
+        const int nh = portrait ? kPortraitH : kScreenH;
+
+        if (layout_root_ != nullptr && nw == root_w_ && nh == root_h_) {
+            // 只是角度变了（0<->180 或 90<->270）：布局尺寸没变，不用重建界面，
+            // 改一下 transform 就行。
+            ESP_LOGI(TAG, "方向切换（布局不变）：%s", qibao::RotationName().c_str());
+            ApplyRootTransform();
+            qibao::ScheduleFullRedraw();
             return;
         }
 
-        const lv_image_dsc_t* first = ok0 ? &dsc0_ : &dsc1_;
-        // 图1 也解码成功时用它做第二帧，否则退化成单张静态图
-        const lv_image_dsc_t* second = (ok0 && ok1) ? &dsc1_ : nullptr;
-
-        // 保持比例：按图片原始尺寸显示（约 264x480），比例天然保持，不拉伸变形。
-        for (int i = 0; i < 2; ++i) {
-            const lv_image_dsc_t* dsc = (i == 0) ? first : second;
-            if (dsc == nullptr) break;
-            lv_obj_t* img = lv_img_create(screen);
-            lv_image_set_src(img, dsc);
-            lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
-            lv_obj_set_style_image_recolor_opa(img, LV_OPA_TRANSP, 0);
-            // 点一下图片就切换站姿/坐姿（手动，不再自动滚动）
-            lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(img, OnImageClicked, LV_EVENT_CLICKED, this);
-            imgs_[i] = img;
-        }
-        if (imgs_[0] != nullptr) lv_obj_move_foreground(imgs_[0]);
-        if (imgs_[1] != nullptr) lv_obj_move_foreground(imgs_[1]);
-
-        CreateRotateButton(screen);
-
-        // 界面建完了，现在才能安全地应用屏幕方向（原因见 qibao_screen.h 的注释）
-        qibao::ApplySavedRotation();
-
-        if (imgs_[1] != nullptr) {
-            cur_frame_ = 0;
-            lv_obj_set_style_opa(imgs_[1], LV_OPA_TRANSP, 0);
-            ESP_LOGI(TAG, "七宝完整全身图 x2 已显示（点图片换姿势，左下角按钮旋转画面）");
-        } else {
-            cur_frame_ = 0;
-            ESP_LOGI(TAG, "七宝完整全身图 x1 已显示（静态）");
-        }
+        // 布局尺寸变了（横屏 <-> 竖屏）：整套重建
+        ESP_LOGI(TAG, "方向切换（布局 %dx%d -> %dx%d），重建界面", root_w_, root_h_, nw, nh);
+        ClearUIObjects();        // 删掉原生 UI 对象
+        DestroyLayoutRoot();     // 删掉旧布局根（人物图/按钮一起没了）
+        EnsureLayoutRoot();      // 按新尺寸建布局根
+        SetLayoutRoot(layout_root_, root_w_, root_h_);
+        setup_ui_called_ = false;
+        SetupUI();               // 重建（里面会再调 EnsureLayoutRoot，幂等）
     }
 
     // 手动切换站姿 / 坐姿（柔和交叉淡入淡出，约 0.6 秒）
@@ -119,8 +146,8 @@ public:
     //
     // 上游 LvglDisplay::SnapshotToJpeg() 用的是 lv_snapshot_take(screen, ...)，
     // 而 LVGL 9.5 的整屏快照走的是 lv_obj_redraw()（见 lv_snapshot.c）：
-    //     if(top_obj == obj) lv_obj_redraw(&layer, top_obj);   // 整屏快照，变换被跳过
-    //     else              lv_obj_refr(&layer, top_obj);     // 快照子对象才走变换
+    //     if(top_obj == obj) lv_obj_redraw(...);   // 整屏快照，变换被跳过
+    //     else              lv_obj_refr(...);     // 快照子对象才走变换
     // 也就是说，屏幕一旦带 transform 翻转，上游快照拍出来的还是「没翻」的画面 ——
     // 会让人误以为旋转没生效。这里改成直接读送显缓冲，拍到的就是屏幕上真实显示的内容。
     // ---------------------------------------------------------------------------
@@ -182,6 +209,172 @@ private:
     inline static const char* TAG = "QibaoDisplay";
     inline static QibaoLcdDisplay* s_instance_ = nullptr;
 
+    // 一套人物图（两张：站姿 + 坐姿），按朝向各缓存一份
+    struct FrameSet {
+        lv_image_dsc_t dsc[2] = {};
+        bool ok[2] = {false, false};
+        bool decoded = false;
+    };
+    FrameSet frames_[2];  // [0]=横屏(480 高)  [1]=竖屏(800 高)
+
+    lv_obj_t* layout_root_ = nullptr;  // 布局根容器（整套界面挂在它下面）
+    int root_w_ = 0;
+    int root_h_ = 0;
+    lv_obj_t* imgs_[2] = {nullptr, nullptr};
+    lv_obj_t* rotate_btn_ = nullptr;
+    int cur_frame_ = 0;
+
+    // ---------------------------------------------------------------------------
+    // 布局根容器
+    // ---------------------------------------------------------------------------
+    void EnsureLayoutRoot() {
+        const bool portrait = qibao::IsPortrait();
+        const int nw = portrait ? kPortraitW : kScreenW;
+        const int nh = portrait ? kPortraitH : kScreenH;
+
+        if (layout_root_ != nullptr && nw == root_w_ && nh == root_h_) {
+            return;  // 尺寸没变，复用
+        }
+
+        DestroyLayoutRoot();
+
+        layout_root_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(layout_root_, nw, nh);
+        // 居中：横屏时正好铺满屏幕；竖屏时上下各超出 160px，
+        // 绕中心转 90° 之后正好变成 800x480 铺满物理屏
+        lv_obj_align(layout_root_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_border_width(layout_root_, 0, 0);
+        lv_obj_set_style_pad_all(layout_root_, 0, 0);
+        lv_obj_set_style_radius(layout_root_, 0, 0);
+        lv_obj_remove_flag(layout_root_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(layout_root_, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+        lv_obj_clear_flag(layout_root_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+
+        root_w_ = nw;
+        root_h_ = nh;
+        qibao::SetLayoutRootHandle(layout_root_);
+        ESP_LOGI(TAG, "布局根容器: %dx%d（%s）", nw, nh, portrait ? "竖屏" : "横屏");
+    }
+
+    void DestroyLayoutRoot() {
+        if (layout_root_ == nullptr) {
+            return;
+        }
+        // 根容器被删掉，里面的人物图/按钮也跟着没了，指针必须置空
+        imgs_[0] = nullptr;
+        imgs_[1] = nullptr;
+        rotate_btn_ = nullptr;
+        lv_obj_del(layout_root_);
+        layout_root_ = nullptr;
+        qibao::SetLayoutRootHandle(nullptr);
+        root_w_ = 0;
+        root_h_ = 0;
+    }
+
+    void ApplyRootTransform() {
+        if (layout_root_ == nullptr) {
+            return;
+        }
+        // 【关键】显式把变换中心设到容器正中（50%/50%）。
+        // LVGL 的 transform_pivot 默认值是 0，也就是对象左上角；
+        // 不设的话画面会绕左上角转，直接飞出屏幕。
+        lv_obj_set_style_transform_pivot_x(layout_root_, LV_PCT(50), 0);
+        lv_obj_set_style_transform_pivot_y(layout_root_, LV_PCT(50), 0);
+        // 角度单位是 0.1 度：900 = 90°，2700 = 270°
+        const int32_t angle = (int32_t)qibao::CurrentRotation();
+        lv_obj_set_style_transform_rotation(layout_root_, angle, 0);
+        lv_obj_invalidate(lv_screen_active());
+        ESP_LOGI(TAG, "应用屏幕变换: rotation=%d (%.0f°)", angle, angle / 10.0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // 背景与原生 UI 的适配
+    // ---------------------------------------------------------------------------
+    void ApplyBackdrop() {
+        if (layout_root_ == nullptr) {
+            return;
+        }
+        // 屏幕背景设成与原图一致的米灰渐变（顶 #81796D -> 底 #CBC3B7），
+        // 这样全身图两侧的留白和图片背景无缝融合，看起来像一整张铺满的图。
+        lv_obj_set_style_bg_color(layout_root_, lv_color_hex(0x81796D), 0);
+        lv_obj_set_style_bg_grad_color(layout_root_, lv_color_hex(0xCBC3B7), 0);
+        lv_obj_set_style_bg_grad_dir(layout_root_, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_opa(layout_root_, LV_OPA_COVER, 0);
+
+        // 小智原生的 container_ 是整屏不透明白底，会把上面的渐变盖掉，
+        // 两侧就变成两条白边。这里把它改成透明，渐变露出来。
+        if (container_ != nullptr) {
+            lv_obj_set_style_bg_opa(container_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(container_, 0, 0);
+        }
+
+        // 竖屏时人物图铺满整个画面，聊天文字压在人物身上会看不清，
+        // 所以把底部字幕条改成不透明（横屏保持半透明，不影响原来的观感）。
+        if (bottom_bar_ != nullptr && qibao::IsPortrait()) {
+            lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(bottom_bar_, lv_color_hex(0x2A2A2A), 0);
+            lv_obj_set_style_text_color(chat_message_label_, lv_color_white(), 0);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 人物图
+    // ---------------------------------------------------------------------------
+    void CreatePersonaImages() {
+        if (layout_root_ == nullptr) {
+            return;
+        }
+        const bool portrait = qibao::IsPortrait();
+        if (!EnsureFrames(portrait)) {
+            ESP_LOGE(TAG, "人物图解码失败，跳过叠加");
+            return;
+        }
+        FrameSet& fs = frames_[portrait ? 1 : 0];
+        const lv_image_dsc_t* first = fs.ok[0] ? &fs.dsc[0] : (fs.ok[1] ? &fs.dsc[1] : nullptr);
+        // 图1 也解码成功时用它做第二帧，否则退化成单张静态图
+        const lv_image_dsc_t* second = (fs.ok[0] && fs.ok[1]) ? &fs.dsc[1] : nullptr;
+
+        for (int i = 0; i < 2; ++i) {
+            const lv_image_dsc_t* dsc = (i == 0) ? first : second;
+            if (dsc == nullptr) break;
+            lv_obj_t* img = lv_img_create(layout_root_);
+            lv_image_set_src(img, dsc);
+            lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_image_recolor_opa(img, LV_OPA_TRANSP, 0);
+            // 点一下图片就切换站姿/坐姿（手动，不再自动滚动）
+            lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(img, OnImageClicked, LV_EVENT_CLICKED, this);
+            imgs_[i] = img;
+        }
+        if (imgs_[0] != nullptr) lv_obj_move_foreground(imgs_[0]);
+        if (imgs_[1] != nullptr) lv_obj_move_foreground(imgs_[1]);
+
+        cur_frame_ = 0;
+        if (imgs_[1] != nullptr) {
+            lv_obj_set_style_opa(imgs_[1], LV_OPA_TRANSP, 0);
+            ESP_LOGI(TAG, "七宝完整全身图 x2 已显示（点图片换姿势，左下角按钮转 90°）");
+        } else {
+            ESP_LOGI(TAG, "七宝完整全身图 x1 已显示（静态）");
+        }
+    }
+
+    // 按朝向解码人物图；解过一次就缓存住，不重复解码
+    bool EnsureFrames(bool portrait) {
+        FrameSet& fs = frames_[portrait ? 1 : 0];
+        if (fs.decoded) {
+            return fs.ok[0] || fs.ok[1];
+        }
+        fs.decoded = true;
+        const int fit_w = portrait ? kPortraitW : kScreenW;
+        const int fit_h = portrait ? kPortraitH : kScreenH;
+        const int64_t t0 = esp_timer_get_time();
+        fs.ok[0] = DecodeFrame(qibao_frame_0_jpg, sizeof(qibao_frame_0_jpg), &fs.dsc[0], 0, fit_w, fit_h);
+        fs.ok[1] = DecodeFrame(qibao_frame_1_jpg, sizeof(qibao_frame_1_jpg), &fs.dsc[1], 1, fit_w, fit_h);
+        ESP_LOGI(TAG, "人物图解码(%s) 耗时 %lld ms", portrait ? "竖屏" : "横屏",
+                 (long long)((esp_timer_get_time() - t0) / 1000));
+        return fs.ok[0] || fs.ok[1];
+    }
+
     // 点图片 → 换姿势
     static void OnImageClicked(lv_event_t* e) {
         auto* self = static_cast<QibaoLcdDisplay*>(lv_event_get_user_data(e));
@@ -190,7 +383,7 @@ private:
         }
     }
 
-    // 点旋转按钮 → 整个画面翻 180°
+    // 点旋转按钮 → 整个画面转 90°
     static void OnRotateClicked(lv_event_t* e) {
         ESP_LOGI(TAG, "旋转按钮：%s", qibao::ToggleRotation().c_str());
     }
@@ -211,8 +404,11 @@ private:
     }
 
     // 左下角旋转按钮：纯图形（圆弧箭头），不依赖中文字体
-    void CreateRotateButton(lv_obj_t* screen) {
-        lv_obj_t* btn = lv_btn_create(screen);
+    void CreateRotateButton() {
+        if (layout_root_ == nullptr) {
+            return;
+        }
+        lv_obj_t* btn = lv_btn_create(layout_root_);
         lv_obj_set_size(btn, 56, 56);
         lv_obj_align(btn, LV_ALIGN_BOTTOM_LEFT, 12, -12);
         lv_obj_set_style_bg_opa(btn, LV_OPA_60, 0);
@@ -223,6 +419,7 @@ private:
         lv_obj_set_style_radius(btn, 28, 0);
         lv_obj_set_style_shadow_width(btn, 0, 0);
         lv_obj_add_event_cb(btn, OnRotateClicked, LV_EVENT_CLICKED, this);
+        rotate_btn_ = btn;
 
         // 圆弧 + 缺口 = 一个「循环箭头」的形状
         lv_obj_t* arc = lv_arc_create(btn);
@@ -239,12 +436,16 @@ private:
         lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
     }
 
-    // 解码到 PSRAM，常驻不释放（形象图一直显示）。返回是否成功。
-    static bool DecodeFrame(const unsigned char* jpg, size_t len, lv_image_dsc_t* dsc, int idx) {
+    // 解码到 PSRAM，常驻不释放（形象图一直显示）。
+    // 【注意】LVGL 删除图片对象时不会释放 VARIABLE 类型的图源，
+    // 所以这里解码出来的数据可以在界面重建时继续复用，不用重新解码。
+    static bool DecodeFrame(const unsigned char* jpg, size_t len, lv_image_dsc_t* dsc, int idx,
+                            int fit_w, int fit_h) {
         uint8_t* out = nullptr;
         size_t out_len = 0, w = 0, h = 0, stride = 0;
-        // max 传屏幕尺寸，解码器会按比例缩放并 round 到 8 的倍数；1080x1920 -> 约 272x480。
-        esp_err_t err = jpeg_to_image_fit(jpg, len, 800, 480, &out, &out_len, &w, &h, &stride);
+        // max 传目标框尺寸，解码器会按比例缩放并 round 到 8 的倍数；
+        // 1080x1920 -> 横屏约 270x480，竖屏约 450x800。
+        esp_err_t err = jpeg_to_image_fit(jpg, len, fit_w, fit_h, &out, &out_len, &w, &h, &stride);
         if (err != ESP_OK || out == nullptr) {
             ESP_LOGE(TAG, "frame%d 解码失败: %s", idx, esp_err_to_name(err));
             return false;
@@ -260,9 +461,4 @@ private:
                  idx, (unsigned)w, (unsigned)h, (unsigned)stride, (unsigned)out_len);
         return true;
     }
-
-    lv_image_dsc_t dsc0_{};
-    lv_image_dsc_t dsc1_{};
-    lv_obj_t* imgs_[2] = {nullptr, nullptr};
-    int cur_frame_ = 0;
 };

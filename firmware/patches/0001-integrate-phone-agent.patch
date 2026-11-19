@@ -1,5 +1,5 @@
 diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
-index 8c318f1..b20d3fc 100644
+index 8c318f1..1ff0708 100644
 --- a/main/CMakeLists.txt
 +++ b/main/CMakeLists.txt
 @@ -1002,6 +1002,38 @@ file(GLOB BOARD_SOURCES
@@ -58,7 +58,22 @@ index 8c318f1..b20d3fc 100644
  if(BOARD_TYPE STREQUAL "m5stack-stick-s3")
      list(APPEND MAIN_PRIV_REQUIRES_EXTRA
          m5stack__m5pm1
-@@ -1218,6 +1260,7 @@ idf_component_register(SRCS ${SOURCES}
+@@ -1192,6 +1234,14 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
+         sdmmc
+     )
+ endif()
++# 七宝妹妹 S31：TF 卡存人脸特征（SDMMC 4bit + FATFS）
++if(CONFIG_BOARD_TYPE_ESP32_S31_KORVO_1)
++    list(APPEND MAIN_PRIV_REQUIRES_EXTRA
++        esp_driver_sdmmc
++        sdmmc
++        fatfs
++    )
++endif()
+ idf_component_register(SRCS ${SOURCES}
+                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
+                     INCLUDE_DIRS ${INCLUDE_DIRS}
+@@ -1218,6 +1268,7 @@ idf_component_register(SRCS ${SOURCES}
                          efuse
                          bt
                          fatfs
@@ -66,7 +81,7 @@ index 8c318f1..b20d3fc 100644
                          xiaozhi-fonts
                          ${MAIN_PRIV_REQUIRES_EXTRA}
                      )
-@@ -1226,6 +1269,9 @@ idf_component_register(SRCS ${SOURCES}
+@@ -1226,6 +1277,9 @@ idf_component_register(SRCS ${SOURCES}
  # dialect; pin the baseline so main/ does not depend on it.
  if(NOT CMAKE_BUILD_EARLY_EXPANSION)
      target_compile_options(${COMPONENT_LIB} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++23>)
@@ -77,10 +92,10 @@ index 8c318f1..b20d3fc 100644
  
  # Use target_compile_definitions to define the reported board identity
 diff --git a/main/application.cc b/main/application.cc
-index e1f0719..1b80ceb 100644
+index e1f0719..5d60a4a 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -20,6 +20,12 @@
+@@ -20,6 +20,17 @@
  #include <cstring>
  #include <limits>
  
@@ -88,26 +103,36 @@ index e1f0719..1b80ceb 100644
 +// 弱符号：板级 Mac 控制模块编译时才会链接到实现；模块关闭时地址为空，自动跳过。
 +// 放在这里而不是 include 板级头文件，避免 main 组件依赖具体板型的头文件路径。
 +extern "C" __attribute__((weak)) bool MacVoiceCommandHook(const char* text);
++// 弱符号：刷脸门禁。板级模块实现后，返回 false 表示未解锁、拒绝执行控制。
++// 未实现（其它板子）时 nullptr，视为不启用门禁。
++extern "C" __attribute__((weak)) bool QibaoGateAllowed(const char* command);
++// 弱符号：唤醒时异步触发刷脸（七宝妹妹）。未实现则跳过。
++extern "C" __attribute__((weak)) void QibaoOnWake();
 +#endif
 +
  #define TAG "Application"
  
  Application::Application() : notify_player_(audio_service_) {
-@@ -686,6 +692,13 @@ void Application::InitializeProtocol() {
+@@ -686,6 +697,18 @@ void Application::InitializeProtocol() {
                      glyphs.clear();
                  }
                  ESP_LOGI(TAG, ">> %s", text->valuestring);
 +#if MAC_CONTROL_ENABLE
 +                // 本地语音指令兜底：只要听清了这句话就执行控制动作，
 +                // 不依赖云端大模型是否决定调用 MCP 工具。
++                // 七宝门禁：执行前先确认已刷脸解锁（10 分钟内有效）。
 +                if (MacVoiceCommandHook != nullptr) {
-+                    MacVoiceCommandHook(text->valuestring);
++                    if (QibaoGateAllowed != nullptr && !QibaoGateAllowed(text->valuestring)) {
++                        ESP_LOGW(TAG, "[Qibao] 门禁未通过，拒绝执行控制指令");
++                    } else {
++                        MacVoiceCommandHook(text->valuestring);
++                    }
 +                }
 +#endif
                  Schedule([display, message = std::string(text->valuestring),
                            glyphs = std::move(glyphs), bpp]() {
                      display->AddTextGlyphs(glyphs, bpp);
-@@ -702,6 +715,9 @@ void Application::InitializeProtocol() {
+@@ -702,6 +725,9 @@ void Application::InitializeProtocol() {
          } else if (strcmp(type->valuestring, "mcp") == 0) {
              auto payload = cJSON_GetObjectItem(root, "payload");
              if (cJSON_IsObject(payload)) {
@@ -117,13 +142,396 @@ index e1f0719..1b80ceb 100644
                  McpServer::GetInstance().ParseMessage(payload);
              }
          } else if (strcmp(type->valuestring, "system") == 0) {
+@@ -928,6 +954,13 @@ void Application::HandleWakeWordDetectedEvent() {
+     auto wake_word = audio_service_.GetLastWakeWord();
+     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+ 
++#if MAC_CONTROL_ENABLE
++    // 七宝妹妹：每次唤醒异步刷一次脸，成功解锁 10 分钟（不阻塞语音通道）。
++    if (QibaoOnWake != nullptr) {
++        QibaoOnWake();
++    }
++#endif
++
+     if (state == kDeviceStateIdle) {
+         BeginWakeWordInvoke(wake_word);
+     } else if (state == kDeviceStateNotifying) {
+diff --git a/main/boards/common/esp_video.h b/main/boards/common/esp_video.h
+index f36d26a..cdb7c43 100644
+--- a/main/boards/common/esp_video.h
++++ b/main/boards/common/esp_video.h
+@@ -49,6 +49,13 @@ public:
+ 
+     virtual void SetExplainUrl(const std::string& url, const std::string& token);
+     virtual bool Capture();
++    // 获取 Capture() 抓取的帧（供本地人脸识別等模块用）。
++    // 返回的指针归本对象所有，调用方不得释放；下次 Capture() 后失效。
++    const uint8_t* GetFrameData() const { return frame_.data; }
++    size_t GetFrameSize() const { return frame_.len; }
++    uint16_t GetFrameWidth() const { return frame_.width; }
++    uint16_t GetFrameHeight() const { return frame_.height; }
++    v4l2_pix_fmt_t GetFrameFormat() const { return frame_.format; }
+     // 翻转控制函数
+     virtual bool SetHMirror(bool enabled) override;
+     virtual bool SetVFlip(bool enabled) override;
+diff --git a/main/display/lcd_display.cc b/main/display/lcd_display.cc
+index 6d0643c..bc58f54 100644
+--- a/main/display/lcd_display.cc
++++ b/main/display/lcd_display.cc
+@@ -384,6 +384,46 @@ bool LcdDisplay::Lock(int timeout_ms) { return lvgl_port_lock(timeout_ms); }
+ 
+ void LcdDisplay::Unlock() { lvgl_port_unlock(); }
+ 
++void LcdDisplay::SetLayoutRoot(lv_obj_t* root, int w, int h) {
++    ui_root_ = root;
++    layout_w_ = w;
++    layout_h_ = h;
++}
++
++void LcdDisplay::ClearUIObjects() {
++    // 先停掉会往旧对象上画东西的定时器 / GIF
++    if (preview_timer_ != nullptr) {
++        esp_timer_stop(preview_timer_);
++    }
++    if (gif_controller_ != nullptr) {
++        gif_controller_->Stop();
++    }
++
++    // 删掉旧界面对象（顺序和析构函数一致：先子后父）
++    if (preview_image_ != nullptr) { lv_obj_del(preview_image_); preview_image_ = nullptr; }
++    if (chat_message_label_ != nullptr) { lv_obj_del(chat_message_label_); chat_message_label_ = nullptr; }
++    if (emoji_label_ != nullptr) { lv_obj_del(emoji_label_); emoji_label_ = nullptr; }
++    if (emoji_image_ != nullptr) { lv_obj_del(emoji_image_); emoji_image_ = nullptr; }
++    if (emoji_box_ != nullptr) { lv_obj_del(emoji_box_); emoji_box_ = nullptr; }
++    if (content_ != nullptr) { lv_obj_del(content_); content_ = nullptr; }
++    if (bottom_bar_ != nullptr) { lv_obj_del(bottom_bar_); bottom_bar_ = nullptr; }
++    if (status_bar_ != nullptr) { lv_obj_del(status_bar_); status_bar_ = nullptr; }
++    if (top_bar_ != nullptr) { lv_obj_del(top_bar_); top_bar_ = nullptr; }
++    if (side_bar_ != nullptr) { lv_obj_del(side_bar_); side_bar_ = nullptr; }
++    if (container_ != nullptr) { lv_obj_del(container_); container_ = nullptr; }
++}
++
++void LcdDisplay::RebuildUI() {
++    DisplayLockGuard lock(this);
++    ESP_LOGI(TAG, "重建 UI：布局 %dx%d，根对象 %p", (int)LayoutW(), (int)LayoutH(), (void*)ui_root_);
++
++    ClearUIObjects();
++
++    // 让 SetupUI() 能重新建一遍（它开头有 setup_ui_called_ 的防重复保护）
++    setup_ui_called_ = false;
++    SetupUI();
++}
++
+ #if CONFIG_USE_WECHAT_MESSAGE_STYLE
+ void LcdDisplay::SetupUI() {
+     // Prevent duplicate calls - if already called, return early
+@@ -400,14 +440,14 @@ void LcdDisplay::SetupUI() {
+     auto icon_font = lvgl_theme->icon_font()->font();
+     auto large_icon_font = lvgl_theme->large_icon_font()->font();
+ 
+-    auto screen = lv_screen_active();
++    auto screen = UiParent();  // 竖屏时 UI 挂在布局根容器里
+     lv_obj_set_style_text_font(screen, text_font, 0);
+     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
+     lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+ 
+     /* Container */
+     container_ = lv_obj_create(screen);
+-    lv_obj_set_size(container_, LV_HOR_RES, LV_VER_RES);
++    lv_obj_set_size(container_, LayoutW(), LayoutH());
+     lv_obj_set_style_radius(container_, 0, 0);
+     lv_obj_set_flex_flow(container_, LV_FLEX_FLOW_COLUMN);
+     lv_obj_set_style_pad_all(container_, 0, 0);
+@@ -418,7 +458,7 @@ void LcdDisplay::SetupUI() {
+ 
+     /* Layer 1: Top bar - for status icons */
+     top_bar_ = lv_obj_create(container_);
+-    lv_obj_set_size(top_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
++    lv_obj_set_size(top_bar_, LayoutW(), LV_SIZE_CONTENT);
+     lv_obj_set_style_radius(top_bar_, 0, 0);
+     lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);  // 50% opacity background
+     lv_obj_set_style_bg_color(top_bar_, lvgl_theme->background_color(), 0);
+@@ -462,7 +502,7 @@ void LcdDisplay::SetupUI() {
+ 
+     /* Layer 2: Status bar - for center text labels */
+     status_bar_ = lv_obj_create(screen);
+-    lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
++    lv_obj_set_size(status_bar_, LayoutW(), LV_SIZE_CONTENT);
+     lv_obj_set_style_radius(status_bar_, 0, 0);
+     lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);  // Transparent background
+     lv_obj_set_style_border_width(status_bar_, 0, 0);
+@@ -474,7 +514,7 @@ void LcdDisplay::SetupUI() {
+     lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);        // Overlap with top_bar_
+ 
+     notification_label_ = lv_label_create(status_bar_);
+-    lv_obj_set_width(notification_label_, LV_HOR_RES * 0.8);
++    lv_obj_set_width(notification_label_, LayoutW() * 0.8);
+     lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+     lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
+     lv_label_set_text(notification_label_, "");
+@@ -482,7 +522,7 @@ void LcdDisplay::SetupUI() {
+     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+ 
+     status_label_ = lv_label_create(status_bar_);
+-    lv_obj_set_width(status_label_, LV_HOR_RES * 0.8);
++    lv_obj_set_width(status_label_, LayoutW() * 0.8);
+     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+     lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
+@@ -492,7 +532,7 @@ void LcdDisplay::SetupUI() {
+     /* Content - Chat area */
+     content_ = lv_obj_create(container_);
+     lv_obj_set_style_radius(content_, 0, 0);
+-    lv_obj_set_width(content_, LV_HOR_RES);
++    lv_obj_set_width(content_, LayoutW());
+     lv_obj_set_flex_grow(content_, 1);
+     lv_obj_set_style_pad_all(content_, lvgl_theme->spacing(4), 0);
+     lv_obj_set_style_border_width(content_, 0, 0);
+@@ -513,7 +553,7 @@ void LcdDisplay::SetupUI() {
+ 
+     low_battery_popup_ = lv_obj_create(screen);
+     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
+-    lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, text_font->line_height * 2);
++    lv_obj_set_size(low_battery_popup_, LayoutW() * 0.9, text_font->line_height * 2);
+     lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -lvgl_theme->spacing(4));
+     lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
+     lv_obj_set_style_radius(low_battery_popup_, lvgl_theme->spacing(4), 0);
+@@ -621,7 +661,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
+     lv_label_set_text(msg_text, content);
+ 
+     // Calculate bubble width constraints
+-    lv_coord_t max_width = LV_HOR_RES * 85 / 100 - 16;  // 85% of screen width
++    lv_coord_t max_width = LayoutW() * 85 / 100 - 16;  // 85% of screen width
+     lv_coord_t min_width = 20;
+ 
+     // Let LVGL calculate the natural text width first
+@@ -700,7 +740,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
+     if (strcmp(role, "user") == 0) {
+         // Create a full-width container
+         lv_obj_t* container = lv_obj_create(content_);
+-        lv_obj_set_width(container, LV_HOR_RES);
++        lv_obj_set_width(container, LayoutW());
+         lv_obj_set_height(container, LV_SIZE_CONTENT);
+ 
+         // Make container transparent and borderless
+@@ -719,7 +759,7 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
+     } else if (strcmp(role, "system") == 0) {
+         // Create full-width container for system messages to ensure center alignment
+         lv_obj_t* container = lv_obj_create(content_);
+-        lv_obj_set_width(container, LV_HOR_RES);
++        lv_obj_set_width(container, LayoutW());
+         lv_obj_set_height(container, LV_SIZE_CONTENT);
+ 
+         lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
+@@ -771,8 +811,8 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
+     lv_obj_t* preview_image = lv_image_create(img_bubble);
+ 
+     // Calculate appropriate size for the image
+-    lv_coord_t max_width = LV_HOR_RES * 70 / 100;   // 70% of screen width
+-    lv_coord_t max_height = LV_VER_RES * 50 / 100;  // 50% of screen height
++    lv_coord_t max_width = LayoutW() * 70 / 100;   // 70% of screen width
++    lv_coord_t max_height = LayoutH() * 50 / 100;  // 50% of screen height
+ 
+     // Calculate zoom factor to fit within maximum dimensions
+     auto img_dsc = image->image_dsc();
+@@ -897,14 +937,14 @@ void LcdDisplay::SetupUI() {
+     auto icon_font = lvgl_theme->icon_font()->font();
+     auto large_icon_font = lvgl_theme->large_icon_font()->font();
+ 
+-    auto screen = lv_screen_active();
++    auto screen = UiParent();  // 竖屏时 UI 挂在布局根容器里
+     lv_obj_set_style_text_font(screen, text_font, 0);
+     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
+     lv_obj_set_style_bg_color(screen, lvgl_theme->background_color(), 0);
+ 
+     /* Container - used as background */
+     container_ = lv_obj_create(screen);
+-    lv_obj_set_size(container_, LV_HOR_RES, LV_VER_RES);
++    lv_obj_set_size(container_, LayoutW(), LayoutH());
+     lv_obj_set_style_radius(container_, 0, 0);
+     lv_obj_set_style_pad_all(container_, 0, 0);
+     lv_obj_set_style_border_width(container_, 0, 0);
+@@ -936,7 +976,7 @@ void LcdDisplay::SetupUI() {
+ 
+     /* Layer 1: Top bar - for status icons */
+     top_bar_ = lv_obj_create(screen);
+-    lv_obj_set_size(top_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
++    lv_obj_set_size(top_bar_, LayoutW(), LV_SIZE_CONTENT);
+     lv_obj_set_style_radius(top_bar_, 0, 0);
+     lv_obj_set_style_bg_opa(top_bar_, LV_OPA_50, 0);  // 50% opacity background
+     lv_obj_set_style_bg_color(top_bar_, lvgl_theme->background_color(), 0);
+@@ -981,7 +1021,7 @@ void LcdDisplay::SetupUI() {
+ 
+     /* Layer 2: Status bar - for center text labels */
+     status_bar_ = lv_obj_create(screen);
+-    lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
++    lv_obj_set_size(status_bar_, LayoutW(), LV_SIZE_CONTENT);
+     lv_obj_set_style_radius(status_bar_, 0, 0);
+     lv_obj_set_style_bg_opa(status_bar_, LV_OPA_TRANSP, 0);  // Transparent background
+     lv_obj_set_style_border_width(status_bar_, 0, 0);
+@@ -993,7 +1033,7 @@ void LcdDisplay::SetupUI() {
+     lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);        // Overlap with top_bar_
+ 
+     notification_label_ = lv_label_create(status_bar_);
+-    lv_obj_set_width(notification_label_, LV_HOR_RES * 0.75);
++    lv_obj_set_width(notification_label_, LayoutW() * 0.75);
+     lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+     lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
+     lv_label_set_text(notification_label_, "");
+@@ -1001,7 +1041,7 @@ void LcdDisplay::SetupUI() {
+     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+ 
+     status_label_ = lv_label_create(status_bar_);
+-    lv_obj_set_width(status_label_, LV_HOR_RES * 0.75);
++    lv_obj_set_width(status_label_, LayoutW() * 0.75);
+     lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+     lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+     lv_obj_set_style_text_color(status_label_, lvgl_theme->text_color(), 0);
+@@ -1011,7 +1051,7 @@ void LcdDisplay::SetupUI() {
+ #if CONFIG_USE_MULTILINE_CHAT_MESSAGE
+     /* Bottom bar - auto height, grows upward with wrapped text */
+     bottom_bar_ = lv_obj_create(screen);
+-    lv_obj_set_width(bottom_bar_, LV_HOR_RES);
++    lv_obj_set_width(bottom_bar_, LayoutW());
+     lv_obj_set_height(bottom_bar_, LV_SIZE_CONTENT);
+     lv_obj_set_style_radius(bottom_bar_, 0, 0);
+     lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+@@ -1025,7 +1065,7 @@ void LcdDisplay::SetupUI() {
+     /* chat_message_label_ placed in bottom_bar_, multiline wrapped display */
+     chat_message_label_ = lv_label_create(bottom_bar_);
+     lv_label_set_text(chat_message_label_, "");
+-    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(8));
++    lv_obj_set_width(chat_message_label_, LayoutW() - lvgl_theme->spacing(8));
+     lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
+@@ -1034,7 +1074,7 @@ void LcdDisplay::SetupUI() {
+ #else
+     /* Top layer: Bottom bar - fixed height at bottom */
+     bottom_bar_ = lv_obj_create(screen);
+-    lv_obj_set_size(bottom_bar_, LV_HOR_RES, text_font->line_height + lvgl_theme->spacing(8));
++    lv_obj_set_size(bottom_bar_, LayoutW(), text_font->line_height + lvgl_theme->spacing(8));
+     lv_obj_set_style_radius(bottom_bar_, 0, 0);
+     lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+     lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);
+@@ -1048,7 +1088,7 @@ void LcdDisplay::SetupUI() {
+     /* chat_message_label_ placed in bottom_bar_, single-line horizontal scroll */
+     chat_message_label_ = lv_label_create(bottom_bar_);
+     lv_label_set_text(chat_message_label_, "");
+-    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(8));
++    lv_obj_set_width(chat_message_label_, LayoutW() - lvgl_theme->spacing(8));
+     lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
+@@ -1067,7 +1107,7 @@ void LcdDisplay::SetupUI() {
+ 
+     low_battery_popup_ = lv_obj_create(screen);
+     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
+-    lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, text_font->line_height * 2);
++    lv_obj_set_size(low_battery_popup_, LayoutW() * 0.9, text_font->line_height * 2);
+     lv_obj_align(low_battery_popup_, LV_ALIGN_BOTTOM_MID, 0, -lvgl_theme->spacing(4));
+     lv_obj_set_style_bg_color(low_battery_popup_, lvgl_theme->low_battery_color(), 0);
+     lv_obj_set_style_radius(low_battery_popup_, lvgl_theme->spacing(4), 0);
+@@ -1280,8 +1320,19 @@ void LcdDisplay::SetTheme(Theme* theme) {
+ 
+     auto lvgl_theme = static_cast<LvglTheme*>(theme);
+ 
+-    // Get the active screen
++    // Get the UI's parent object.
++    //
++    // 【必须用 UiParent() 而不是 lv_screen_active()】
++    // 竖屏适配时整套 UI 挂在「布局根容器」下面，字体样式要设在根容器上。
++    // 如果还设在物理屏上：
++    //   - 运行时资源包会换新字体（LvglDisplay::SetTextFont -> SetTheme），
++    //     换完旧字体对象就被释放了；
++    //   - 而布局根容器上还挂着旧字体的野指针 ->
++    //     一画字就跳到野地址，Guru Meditation（实测：激活页加载资源包时崩）。
++    // 物理屏本身也要一起设：SetupUI 之前可能已经调过一次 SetTheme，
++    // 那时字体是设在物理屏上的，不更新的话物理屏上会留个野指针。
+     lv_obj_t* screen = lv_screen_active();
++    lv_obj_t* ui_parent = UiParent();
+ 
+     // Set font
+     auto text_font = lvgl_theme->text_font()->font();
+@@ -1301,6 +1352,11 @@ void LcdDisplay::SetTheme(Theme* theme) {
+     // Set parent text color
+     lv_obj_set_style_text_font(screen, text_font, 0);
+     lv_obj_set_style_text_color(screen, lvgl_theme->text_color(), 0);
++    if (ui_parent != screen) {
++        // 竖屏：布局根容器也要挂上当前字体（见上面的注释）
++        lv_obj_set_style_text_font(ui_parent, text_font, 0);
++        lv_obj_set_style_text_color(ui_parent, lvgl_theme->text_color(), 0);
++    }
+ 
+     // Set background image
+     if (lvgl_theme->background_image() != nullptr) {
+diff --git a/main/display/lcd_display.h b/main/display/lcd_display.h
+index c528ea5..2d96ab5 100644
+--- a/main/display/lcd_display.h
++++ b/main/display/lcd_display.h
+@@ -33,10 +33,29 @@ protected:
+     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
+ 
++    // ---- 竖屏适配（2026-11-19，七宝妹妹）----
++    // UI 布局根对象：为 nullptr 时用 screen。
++    // 竖屏时把整套 UI 塞进一个 480x800 的容器，容器再整体旋转 90°，
++    // 正好铺满 800x480 的物理屏（LVGL 的命中判定自带逆变换，触摸自动跟随）。
++    lv_obj_t* ui_root_ = nullptr;
++    int layout_w_ = 0;  // UI 布局宽（<=0 表示用面板宽 width_）
++    int layout_h_ = 0;  // UI 布局高（<=0 表示用面板高 height_）
++
++    // UI 实际使用的布局尺寸（横竖屏会变）
++    lv_coord_t LayoutW() const { return layout_w_ > 0 ? layout_w_ : width_; }
++    lv_coord_t LayoutH() const { return layout_h_ > 0 ? layout_h_ : height_; }
++    // UI 挂载的父对象
++    lv_obj_t* UiParent() const { return ui_root_ != nullptr ? ui_root_ : lv_screen_active(); }
++
+     void InitializeLcdThemes();
+     virtual bool Lock(int timeout_ms = 0) override;
+     virtual void Unlock() override;
+ 
++    // 清掉当前界面的所有对象（不重建）。
++    // 换屏幕方向时布局尺寸会变，派生类需要先清空再换布局根容器重建，
++    // 所以把删除逻辑单独拆出来，RebuildUI() 和派生类共用。
++    void ClearUIObjects();
++
+ protected:
+     // Add protected constructor
+     LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
+@@ -55,6 +74,12 @@ public:
+ 
+     // Set whether to hide chat messages/subtitles
+     virtual void SetHideSubtitle(bool hide) override;
++
++    // 切换 UI 布局（竖屏适配用）：root 为布局根对象，w/h 为布局尺寸
++    void SetLayoutRoot(lv_obj_t* root, int w, int h);
++
++    // 按当前布局重建整套界面（换屏幕方向后调用）
++    virtual void RebuildUI();
+ };
+ 
+ // SPI LCD display
 diff --git a/main/idf_component.yml b/main/idf_component.yml
-index c9c64ec..ba8eb08 100644
+index c9c64ec..d8589cb 100644
 --- a/main/idf_component.yml
 +++ b/main/idf_component.yml
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,22 @@
  ## IDF Component Manager Manifest File
  dependencies:
++  # 七宝妹妹：人脸识别门禁（仅 S31 板上用，参考 HwzLoveDz/esp32-s31-camera-lab 实测版本）
++  espressif/esp-dl:
++    version: "3.3.11"
++    rules:
++    - if: target in [esp32s31]
++  espressif/human_face_detect:
++    version: "0.4.2"
++    rules:
++    - if: target in [esp32s31]
++  espressif/human_face_recognition:
++    version: "0.3.2"
++    rules:
++    - if: target in [esp32s31]
 +  espressif/esp_tinyusb:
 +    version: "^1.7"
 +    rules:

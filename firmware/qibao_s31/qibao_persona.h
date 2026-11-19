@@ -64,6 +64,10 @@ std::string AffectionateLine();
 // 返回状态摘要（供串口命令和 MCP 工具查询）
 std::string StatusJson();
 
+// 抓一帧摄像头画面（**已按当前屏幕方向去旋转**），编码成 JPEG 返回。
+// 调试用：切到竖屏后抓一张看看人脸是不是正的。
+bool CaptureCameraJpeg(std::string& jpeg, int quality = 75);
+
 // ---- 与固件主程序的桥接 ----
 // 实现 application.cc 的门禁弱符号、注册 self.qibao MCP 工具。
 // 在板级构造函数里和 Start() 一起调用。
