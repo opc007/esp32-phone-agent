@@ -7,8 +7,9 @@
 //   - 保持原比例（不拉伸变形），高度铺满屏幕，居中显示；
 //   - 屏幕背景设成与原图一致的米灰渐变，左右留白自然融合，看起来像一整张铺满的图；
 //   - 图片以压缩 JPG 编进固件（省 flash），启动时解码到 PSRAM；
-//   - **不再自动轮播**：改成手动切换 —— 点一下图片就在站姿/坐姿之间柔和淡入淡出；
+//   - 轻点画面任意处（除左下角小旋转按钮）就和七宝开始/结束对话，不用找板子上的按键；
 //   - 左下角有一个旋转按钮，点一下转 90°（这块板没有加速度计，只能手动）。
+//   - 换站姿/坐姿仍可用串口 qpose，不再占用轻点。
 //
 // ---------------------------------------------------------------------------
 // 四挡方向是怎么做的（核心原理见 qibao_screen.h 的注释）
@@ -30,6 +31,7 @@
 #include "display/lcd_display.h"
 #include "qibao_frames.h"
 #include "qibao_screen.h"
+#include "application.h"
 
 #include <esp_heap_caps.h>
 #include <esp_lcd_panel_io.h>
@@ -77,6 +79,7 @@ public:
         ApplyBackdrop();                   // 米灰渐变背景 + 让原生容器透明
         CreatePersonaImages();             // 人物图（解码结果按朝向缓存，不重复解码）
         CreateRotateButton();              // 左下角旋转按钮
+        CreateTalkLayer();                 // 盖住画面的透明层：轻点即对话，旋转按钮留在最上面
 
         // 【关键】界面建完了，现在才能安全地套上旋转变换。
         // 原因见 qibao_screen.h 的说明 6：界面没建就设 transform，
@@ -341,9 +344,8 @@ private:
             lv_image_set_src(img, dsc);
             lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
             lv_obj_set_style_image_recolor_opa(img, LV_OPA_TRANSP, 0);
-            // 点一下图片就切换站姿/坐姿（手动，不再自动滚动）
-            lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(img, OnImageClicked, LV_EVENT_CLICKED, this);
+            // 人物图本身不吃触摸。轻点交给上面的透明层，用来开口说话。
+            lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
             imgs_[i] = img;
         }
         if (imgs_[0] != nullptr) lv_obj_move_foreground(imgs_[0]);
@@ -352,7 +354,7 @@ private:
         cur_frame_ = 0;
         if (imgs_[1] != nullptr) {
             lv_obj_set_style_opa(imgs_[1], LV_OPA_TRANSP, 0);
-            ESP_LOGI(TAG, "七宝完整全身图 x2 已显示（点图片换姿势，左下角按钮转 90°）");
+            ESP_LOGI(TAG, "七宝完整全身图 x2 已显示（轻点画面说话，左下角按钮转 90°）");
         } else {
             ESP_LOGI(TAG, "七宝完整全身图 x1 已显示（静态）");
         }
@@ -375,11 +377,35 @@ private:
         return fs.ok[0] || fs.ok[1];
     }
 
-    // 点图片 → 换姿势
-    static void OnImageClicked(lv_event_t* e) {
-        auto* self = static_cast<QibaoLcdDisplay*>(lv_event_get_user_data(e));
-        if (self != nullptr) {
-            self->SwitchPose();
+    // 轻点画面 → 和七宝开始或结束这一轮对话（等同短按 MODE，不用找按键）
+    static void OnScreenTapped(lv_event_t* e) {
+        (void)e;
+        static int64_t last_us = 0;
+        const int64_t now = esp_timer_get_time();
+        if (now - last_us < 600000) {
+            return;
+        }
+        last_us = now;
+        ESP_LOGI(TAG, "轻触屏幕：和七宝开始/结束对话");
+        Application::GetInstance().ToggleChatState();
+    }
+
+    // 透明全屏层盖在人物图上，专门接轻点。旋转按钮之后会被挪到它上面。
+    void CreateTalkLayer() {
+        if (layout_root_ == nullptr) {
+            return;
+        }
+        lv_obj_t* hit = lv_obj_create(layout_root_);
+        lv_obj_set_size(hit, LV_PCT(100), LV_PCT(100));
+        lv_obj_align(hit, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_opa(hit, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(hit, 0, 0);
+        lv_obj_set_style_pad_all(hit, 0, 0);
+        lv_obj_clear_flag(hit, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(hit, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(hit, OnScreenTapped, LV_EVENT_CLICKED, this);
+        if (rotate_btn_ != nullptr) {
+            lv_obj_move_foreground(rotate_btn_);
         }
     }
 
