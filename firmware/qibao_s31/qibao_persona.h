@@ -69,6 +69,20 @@ std::string StatusJson();
 // 调试用：切到竖屏后抓一张看看人脸是不是正的。
 bool CaptureCameraJpeg(std::string& jpeg, int quality = 75);
 
+// ---- 视频小窗（只有用户点开摄像头才跑，开机/唤醒不自动开）----
+void SetCameraWatch(bool on);
+bool CameraWatchOn();
+bool CameraWatchLarge();
+void SetCameraWatchLarge(bool large);
+
+// 把最近一帧缩放进 dst（紧密 RGB565）。还没有帧就返回 false。
+bool CopyLatestFrame(uint8_t* dst, int dst_w, int dst_h);
+
+// 小窗角标：岗哥 / 访客 / 空（没看清或摄像头关着）。
+const char* ViewerBadge();
+// 给小智模型的语气说明。不是用户说的话，不要当 STT 念出来。
+std::string ViewerInstruction();
+
 // ---- 与固件主程序的桥接 ----
 // 实现 application.cc 的门禁弱符号、注册 self.qibao MCP 工具。
 // 在板级构造函数里和 Start() 一起调用。

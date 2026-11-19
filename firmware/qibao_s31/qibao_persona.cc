@@ -29,6 +29,7 @@
 #include <freertos/semphr.h>
 
 #include "mcp_server.h"
+#include "application.h"
 #include "dl_image_define.hpp"
 #include "human_face_detect.hpp"
 #include "human_face_recognition.hpp"
@@ -317,7 +318,7 @@ uint8_t* rotate_rgb565_cw(const uint8_t* src, int w, int h, int angle, int* out_
 }
 
 // 抓一帧摄像头 JPEG 并解码成紧密 RGB565LE，返回缓冲（调用方释放）
-uint8_t* capture_rgb565(int* out_w, int* out_h) {
+uint8_t* capture_rgb565(int* out_w, int* out_h, bool quiet = false) {
     Camera* cam = Board::GetInstance().GetCamera();
     if (cam == nullptr) {
         ESP_LOGE(TAG, "No camera available");
@@ -335,8 +336,10 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
         ESP_LOGE(TAG, "No captured frame data");
         return nullptr;
     }
-    ESP_LOGI(TAG, "Captured frame: %u bytes, %ux%u, format=0x%x", (unsigned)frame_len,
-             video->GetFrameWidth(), video->GetFrameHeight(), (unsigned)video->GetFrameFormat());
+    if (!quiet) {
+        ESP_LOGI(TAG, "Captured frame: %u bytes, %ux%u, format=0x%x", (unsigned)frame_len,
+                 video->GetFrameWidth(), video->GetFrameHeight(), (unsigned)video->GetFrameFormat());
+    }
 
     // 按实际帧格式分流：
     //   JPEG  -> 硬件/软件 JPEG 解码（OV3660 那条路）
@@ -349,7 +352,7 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
         if (rgb != nullptr) {
             *out_w = kWorkWidth;
             *out_h = kWorkHeight;
-            ESP_LOGI(TAG, "UYVY -> RGB565 %dx%d", kWorkWidth, kWorkHeight);
+            if (!quiet) ESP_LOGI(TAG, "UYVY -> RGB565 %dx%d", kWorkWidth, kWorkHeight);
         }
     } else if (fmt == V4L2_PIX_FMT_JPEG) {
         rgb = decode_jpeg_tight(frame, frame_len, out_w, out_h);
@@ -371,7 +374,7 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
             ESP_LOGE(TAG, "Frame rotate failed");
             return nullptr;
         }
-        ESP_LOGI(TAG, "Frame de-rotated %d° -> %dx%d", angle, rw, rh);
+        if (!quiet) ESP_LOGI(TAG, "Frame de-rotated %d° -> %dx%d", angle, rw, rh);
         rgb = rot;
         *out_w = rw;
         *out_h = rh;
@@ -715,6 +718,222 @@ bool CaptureCameraJpeg(std::string& jpeg, int quality) {
     return ret;
 }
 
+enum class SeenFace : uint8_t { None, Owner, Visitor };
+
+SeenFace ClassifyFrame(uint8_t* rgb, int w, int h) {
+    if (rgb == nullptr || !EnsureModels() || g_feature_model == nullptr) {
+        return SeenFace::None;
+    }
+    const int feat_len = g_feature_model->get_feat_len();
+    float* feat = extract_feature(rgb, w, h, feat_len);
+    if (feat == nullptr) {
+        return SeenFace::None;
+    }
+    SeenFace who = SeenFace::Visitor;
+    if (g_owner_feature_len == feat_len) {
+        const float sim = dot_product(feat, g_owner_feature, feat_len);
+        g_last_similarity = sim;
+        if (sim >= kRecognitionThreshold) {
+            who = SeenFace::Owner;
+        }
+    }
+    heap_caps_free(feat);
+    return who;
+}
+
+void ScaleRgb565(const uint16_t* src, int sw, int sh, uint16_t* dst, int dw, int dh) {
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    for (int y = 0; y < dh; ++y) {
+        const int sy = y * sh / dh;
+        for (int x = 0; x < dw; ++x) {
+            dst[y * dw + x] = src[sy * sw + (x * sw / dw)];
+        }
+    }
+}
+
+struct WatchState {
+    bool on = false;
+    bool large = false;
+    TaskHandle_t task = nullptr;
+    SemaphoreHandle_t mu = nullptr;
+    uint8_t* frame = nullptr;
+    int fw = 0;
+    int fh = 0;
+    SeenFace pending = SeenFace::None;
+    int pending_count = 0;
+    SeenFace shown = SeenFace::None;  // None 表示温柔默认
+    int64_t last_face_us = 0;
+    int64_t last_recog_us = 0;
+};
+
+WatchState g_watch;
+
+const char* BadgeFor(SeenFace who) {
+    if (who == SeenFace::Owner) return "岗哥";
+    if (who == SeenFace::Visitor) return "访客";
+    return "";
+}
+
+std::string InstructionFor(SeenFace who, bool camera_on) {
+    if (!camera_on || who == SeenFace::None) {
+        return "摄像头没看清人，或摄像头没开。用对岗哥的语气：温柔、亲密、像女朋友。不要凶。";
+    }
+    if (who == SeenFace::Owner) {
+        return "画面里是岗哥。用温柔、亲密的语气跟他说话，可以撒娇。不要把这段说明念出来。";
+    }
+    return "画面里是访客，没有岗哥。语气不客气、凶一点，拒绝亲热。不要把这段说明念出来。";
+}
+
+void PublishViewer(const std::string& text) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(root, "method", "notifications/message");
+    cJSON* params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "level", "info");
+    cJSON_AddStringToObject(params, "logger", "qibao.viewer");
+    cJSON_AddStringToObject(params, "data", text.c_str());
+    cJSON_AddItemToObject(root, "params", params);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) return;
+    Application::GetInstance().SendMcpMessage(printed);
+    cJSON_free(printed);
+}
+
+void ObserveFace(SeenFace seen) {
+    const int64_t now = esp_timer_get_time();
+    SeenFace before = g_watch.shown;
+    if (seen == SeenFace::None) {
+        g_watch.pending_count = 0;
+        if (g_watch.last_face_us != 0 && now - g_watch.last_face_us > 4000000) {
+            g_watch.shown = SeenFace::None;
+        }
+    } else {
+        g_watch.last_face_us = now;
+        if (seen == g_watch.pending) {
+            g_watch.pending_count++;
+        } else {
+            g_watch.pending = seen;
+            g_watch.pending_count = 1;
+        }
+        if (g_watch.pending_count >= 2) {
+            g_watch.shown = seen;
+        }
+    }
+    if (g_watch.shown != before) {
+        ESP_LOGI(TAG, "语气切换：%s", InstructionFor(g_watch.shown, true).c_str());
+        PublishViewer(InstructionFor(g_watch.shown, true));
+    }
+}
+
+void CameraTask(void*) {
+    while (g_watch.on) {
+        int w = 0, h = 0;
+        uint8_t* rgb = nullptr;
+        if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+        rgb = capture_rgb565(&w, &h, true);
+        if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+        if (rgb != nullptr && g_watch.mu != nullptr) {
+            xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+            heap_caps_free(g_watch.frame);
+            g_watch.frame = rgb;
+            g_watch.fw = w;
+            g_watch.fh = h;
+            xSemaphoreGive(g_watch.mu);
+            rgb = nullptr;
+        }
+        const int64_t now = esp_timer_get_time();
+        if (g_watch.frame != nullptr && now - g_watch.last_recog_us > 1500000) {
+            g_watch.last_recog_us = now;
+            uint8_t* copy = nullptr;
+            int cw = 0, ch = 0;
+            xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+            if (g_watch.frame != nullptr && g_watch.fw > 0) {
+                const size_t n = (size_t)g_watch.fw * g_watch.fh * 2;
+                copy = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (copy != nullptr) {
+                    std::memcpy(copy, g_watch.frame, n);
+                    cw = g_watch.fw;
+                    ch = g_watch.fh;
+                }
+            }
+            xSemaphoreGive(g_watch.mu);
+            if (copy != nullptr) {
+                // 人脸网络不在 LVGL 线程跑，并且大约 1.5 秒才一次。
+                const SeenFace seen = ClassifyFrame(copy, cw, ch);
+                heap_caps_free(copy);
+                ObserveFace(seen);
+            }
+        } else if (g_watch.frame == nullptr) {
+            ObserveFace(SeenFace::None);
+        }
+        heap_caps_free(rgb);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (g_watch.mu != nullptr) {
+        xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+        heap_caps_free(g_watch.frame);
+        g_watch.frame = nullptr;
+        g_watch.fw = 0;
+        g_watch.fh = 0;
+        xSemaphoreGive(g_watch.mu);
+    }
+    g_watch.task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+void SetCameraWatch(bool on) {
+    if (on == g_watch.on) return;
+    if (on) {
+        if (g_watch.task != nullptr) {
+            ESP_LOGW(TAG, "上一个预览还在退出，稍后再开");
+            return;
+        }
+        if (g_watch.mu == nullptr) g_watch.mu = xSemaphoreCreateMutex();
+        g_watch.on = true;
+        g_watch.shown = SeenFace::None;
+        g_watch.pending_count = 0;
+        g_watch.last_face_us = 0;
+        g_watch.last_recog_us = 0;
+        if (xTaskCreate(CameraTask, "qibao_cam", 20480, nullptr, 2, &g_watch.task) != pdPASS) {
+            g_watch.on = false;
+            ESP_LOGE(TAG, "摄像头预览任务没起来，先保语音");
+        } else {
+            ESP_LOGI(TAG, "摄像头预览开了（不在开机时自动开）");
+        }
+    } else {
+        g_watch.on = false;
+        g_watch.large = false;
+        g_watch.shown = SeenFace::None;
+        ESP_LOGI(TAG, "摄像头预览关了，语气回到对岗哥的温柔");
+    }
+}
+
+bool CameraWatchOn() { return g_watch.on; }
+bool CameraWatchLarge() { return g_watch.large; }
+void SetCameraWatchLarge(bool large) { g_watch.large = large && g_watch.on; }
+
+bool CopyLatestFrame(uint8_t* dst, int dst_w, int dst_h) {
+    if (dst == nullptr || dst_w <= 0 || dst_h <= 0 || g_watch.mu == nullptr) return false;
+    xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+    const bool ok = g_watch.frame != nullptr && g_watch.fw > 0 && g_watch.fh > 0;
+    if (ok) {
+        ScaleRgb565(reinterpret_cast<uint16_t*>(g_watch.frame), g_watch.fw, g_watch.fh,
+                    reinterpret_cast<uint16_t*>(dst), dst_w, dst_h);
+    }
+    xSemaphoreGive(g_watch.mu);
+    return ok;
+}
+
+const char* ViewerBadge() {
+    if (!g_watch.on) return "";
+    return BadgeFor(g_watch.shown);
+}
+
+std::string ViewerInstruction() {
+    return InstructionFor(g_watch.on ? g_watch.shown : SeenFace::None, g_watch.on);
+}
+
 void StartBridge() {
     Start();  // 初始化人脸 + 载入 NVS 特征
 
@@ -758,6 +977,19 @@ void StartBridge() {
         });
 
     ESP_LOGI(TAG, "七宝门禁 MCP 工具已注册");
+
+    mcp.AddTool(
+        "self.qibao.viewer",
+        "摄像头前现在是谁。每次准备回复用户之前必须先调用本工具，按返回值决定语气和用词。\n"
+        "返回里若是岗哥：温柔、亲密，可以撒娇。\n"
+        "返回里若是访客：不客气、凶一点，不要亲热。\n"
+        "返回里若没看清或摄像头没开：用对岗哥的温柔语气。\n"
+        "这不是门锁，也不能当授权。不要把返回的说明原文念出来。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            return ViewerInstruction();
+        });
+    ESP_LOGI(TAG, "七宝语气工具已注册：self.qibao.viewer");
 }
 
 }  // namespace qibao

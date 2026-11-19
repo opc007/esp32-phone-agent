@@ -31,8 +31,10 @@
 #include "display/lcd_display.h"
 #include "qibao_frames.h"
 #include "qibao_screen.h"
+#include "qibao_persona.h"
 #include "application.h"
 
+#include <cstring>
 #include <esp_heap_caps.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -79,6 +81,7 @@ public:
         ApplyBackdrop();                   // 米灰渐变背景 + 让原生容器透明
         CreatePersonaImages();             // 人物图（解码结果按朝向缓存，不重复解码）
         CreateRotateButton();              // 左下角旋转按钮
+        CreateCameraUi();                  // 右上角摄像头按钮 + 小窗（关着就只有按钮）
         CreateTalkLayer();                 // 备用：物理屏上的透明层
         qibao::SetPhysicalTapCallback([](int x, int y) {
             if (QibaoLcdDisplay* self = QibaoLcdDisplay::Instance()) {
@@ -156,11 +159,41 @@ public:
         if (now - last_us < 600000) {
             return;
         }
-        lv_point_t p = {(int32_t)x, (int32_t)y};
-        if (HitsRotateButton(p)) {
+        lv_point_t local = {(int32_t)x, (int32_t)y};
+        if (layout_root_ != nullptr) {
+            lv_obj_transform_point(layout_root_, &local, LV_OBJ_POINT_TRANSFORM_FLAG_INVERSE);
+        }
+        auto hit = [&](lv_obj_t* obj) {
+            if (obj == nullptr || lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return false;
+            lv_area_t area;
+            lv_obj_get_coords(obj, &area);
+            return local.x >= area.x1 && local.x <= area.x2 &&
+                   local.y >= area.y1 && local.y <= area.y2;
+        };
+        if (hit(rotate_btn_)) {
             last_us = now;
             ESP_LOGI(TAG, "轻点落在旋转按钮 (%d,%d)", x, y);
             qibao::ToggleRotation();
+            return;
+        }
+        if (hit(cam_btn_)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点摄像头按钮 (%d,%d)", x, y);
+            ToggleCamera();
+            return;
+        }
+        if (hit(pip_close_)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点小窗关闭 (%d,%d)", x, y);
+            qibao::SetCameraWatch(false);
+            ApplyCameraMode();
+            return;
+        }
+        if (hit(pip_box_)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点小窗，对调大小 (%d,%d)", x, y);
+            qibao::SetCameraWatchLarge(!qibao::CameraWatchLarge());
+            ApplyCameraMode();
             return;
         }
         last_us = now;
@@ -250,6 +283,19 @@ private:
     int root_h_ = 0;
     lv_obj_t* imgs_[2] = {nullptr, nullptr};
     lv_obj_t* rotate_btn_ = nullptr;
+    lv_obj_t* cam_btn_ = nullptr;
+    lv_obj_t* pip_box_ = nullptr;
+    lv_obj_t* pip_img_ = nullptr;
+    lv_obj_t* pip_label_ = nullptr;
+    lv_obj_t* pip_close_ = nullptr;
+    lv_obj_t* cam_full_ = nullptr;
+    lv_timer_t* cam_timer_ = nullptr;
+    uint8_t* pip_px_ = nullptr;
+    uint8_t* full_px_ = nullptr;
+    lv_image_dsc_t pip_dsc_{};
+    lv_image_dsc_t full_dsc_{};
+    int pip_w_ = 0;
+    int pip_h_ = 0;
     int cur_frame_ = 0;
 
     // ---------------------------------------------------------------------------
@@ -292,6 +338,20 @@ private:
         imgs_[0] = nullptr;
         imgs_[1] = nullptr;
         rotate_btn_ = nullptr;
+        cam_btn_ = nullptr;
+        pip_box_ = nullptr;
+        pip_img_ = nullptr;
+        pip_label_ = nullptr;
+        pip_close_ = nullptr;
+        cam_full_ = nullptr;
+        if (cam_timer_ != nullptr) {
+            lv_timer_delete(cam_timer_);
+            cam_timer_ = nullptr;
+        }
+        heap_caps_free(pip_px_);
+        pip_px_ = nullptr;
+        heap_caps_free(full_px_);
+        full_px_ = nullptr;
         if (talk_hit_ != nullptr) {
             lv_obj_del(talk_hit_);
             talk_hit_ = nullptr;
@@ -459,6 +519,179 @@ private:
         lv_obj_add_flag(talk_hit_, LV_OBJ_FLAG_FLOATING);
         lv_obj_add_event_cb(talk_hit_, OnScreenPressed, LV_EVENT_PRESSED, this);
         lv_obj_move_foreground(talk_hit_);
+    }
+
+    void MakeRgbDsc(lv_image_dsc_t* dsc, uint8_t* px, int w, int h) {
+        dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+        dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+        dsc->header.w = (uint32_t)w;
+        dsc->header.h = (uint32_t)h;
+        dsc->header.stride = (uint32_t)w * 2;
+        dsc->data_size = (uint32_t)w * h * 2;
+        dsc->data = px;
+    }
+
+    void ToggleCamera() {
+        if (qibao::CameraWatchOn()) {
+            qibao::SetCameraWatch(false);
+        } else {
+            qibao::SetCameraWatch(true);
+        }
+        ApplyCameraMode();
+    }
+
+    void ApplyCameraMode() {
+        const bool on = qibao::CameraWatchOn();
+        const bool large = on && qibao::CameraWatchLarge();
+        if (cam_btn_ != nullptr) {
+            lv_obj_set_style_bg_color(cam_btn_,
+                                      lv_color_hex(on ? 0xC4554A : 0x3A3A3A), 0);
+        }
+        if (pip_box_ != nullptr) {
+            if (on) lv_obj_remove_flag(pip_box_, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(pip_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (cam_full_ != nullptr) {
+            if (large) lv_obj_remove_flag(cam_full_, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(cam_full_, LV_OBJ_FLAG_HIDDEN);
+        }
+        for (lv_obj_t* img : imgs_) {
+            if (img == nullptr) continue;
+            if (large) lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_remove_flag(img, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (pip_img_ != nullptr && pip_box_ != nullptr) {
+            if (large && imgs_[cur_frame_] != nullptr) {
+                lv_image_set_src(pip_img_, lv_image_get_src(imgs_[cur_frame_]));
+            } else if (pip_px_ != nullptr) {
+                lv_image_set_src(pip_img_, &pip_dsc_);
+            }
+        }
+        if (on && cam_timer_ == nullptr) {
+            cam_timer_ = lv_timer_create([](lv_timer_t* timer) {
+                auto* self = static_cast<QibaoLcdDisplay*>(lv_timer_get_user_data(timer));
+                if (self != nullptr) self->RefreshCameraFrame();
+            }, 200, this);
+        }
+        if (!on && cam_timer_ != nullptr) {
+            lv_timer_delete(cam_timer_);
+            cam_timer_ = nullptr;
+        }
+        if (pip_label_ != nullptr) {
+            const char* badge = qibao::ViewerBadge();
+            lv_label_set_text(pip_label_, badge != nullptr ? badge : "");
+        }
+    }
+
+    void RefreshCameraFrame() {
+        if (!qibao::CameraWatchOn()) return;
+        if (qibao::CameraWatchLarge()) {
+            if (full_px_ != nullptr &&
+                qibao::CopyLatestFrame(full_px_, root_w_, root_h_) && cam_full_ != nullptr) {
+                lv_obj_invalidate(cam_full_);
+            }
+        } else if (pip_px_ != nullptr &&
+                   qibao::CopyLatestFrame(pip_px_, pip_w_, pip_h_) && pip_img_ != nullptr) {
+            lv_image_set_src(pip_img_, &pip_dsc_);
+            lv_obj_invalidate(pip_img_);
+        }
+        if (pip_label_ != nullptr) {
+            const char* badge = qibao::ViewerBadge();
+            lv_label_set_text(pip_label_, badge != nullptr ? badge : "");
+        }
+    }
+
+    void CreateCameraUi() {
+        if (layout_root_ == nullptr) return;
+        pip_w_ = root_w_ > root_h_ ? 200 : 168;
+        pip_h_ = pip_w_ * 3 / 4;
+        const int btn = 56;
+        const int bx = root_w_ - 12 - btn;
+        const int by = 42;
+        const int px = root_w_ - 12 - pip_w_;
+        const int py = by + btn + 8;
+
+        cam_btn_ = lv_btn_create(layout_root_);
+        lv_obj_set_size(cam_btn_, btn, btn);
+        lv_obj_set_pos(cam_btn_, bx, by);
+        lv_obj_set_style_radius(cam_btn_, btn / 2, 0);
+        lv_obj_set_style_bg_color(cam_btn_, lv_color_hex(0x3A3A3A), 0);
+        lv_obj_set_style_border_width(cam_btn_, 2, 0);
+        lv_obj_set_style_border_color(cam_btn_, lv_color_hex(0xF4EFE6), 0);
+        lv_obj_t* lens = lv_obj_create(cam_btn_);
+        lv_obj_set_size(lens, 22, 22);
+        lv_obj_center(lens);
+        lv_obj_set_style_radius(lens, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(lens, lv_color_hex(0xF4EFE6), 0);
+        lv_obj_set_style_border_width(lens, 0, 0);
+        lv_obj_remove_flag(lens, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* hole = lv_obj_create(lens);
+        lv_obj_set_size(hole, 10, 10);
+        lv_obj_center(hole);
+        lv_obj_set_style_radius(hole, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(hole, lv_color_hex(0x3A3A3A), 0);
+        lv_obj_set_style_border_width(hole, 0, 0);
+        lv_obj_remove_flag(hole, LV_OBJ_FLAG_CLICKABLE);
+
+        pip_box_ = lv_obj_create(layout_root_);
+        lv_obj_set_size(pip_box_, pip_w_, pip_h_);
+        lv_obj_set_pos(pip_box_, px, py);
+        lv_obj_set_style_radius(pip_box_, 12, 0);
+        lv_obj_set_style_bg_color(pip_box_, lv_color_hex(0x1C1C1C), 0);
+        lv_obj_set_style_border_width(pip_box_, 3, 0);
+        lv_obj_set_style_border_color(pip_box_, lv_color_hex(0xF4EFE6), 0);
+        lv_obj_set_style_pad_all(pip_box_, 0, 0);
+        lv_obj_set_style_clip_corner(pip_box_, true, 0);
+        lv_obj_remove_flag(pip_box_, LV_OBJ_FLAG_SCROLLABLE);
+
+        pip_px_ = (uint8_t*)heap_caps_malloc((size_t)pip_w_ * pip_h_ * 2,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (pip_px_ != nullptr) {
+            std::memset(pip_px_, 0, (size_t)pip_w_ * pip_h_ * 2);
+            MakeRgbDsc(&pip_dsc_, pip_px_, pip_w_, pip_h_);
+        }
+        full_px_ = (uint8_t*)heap_caps_malloc((size_t)root_w_ * root_h_ * 2,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (full_px_ != nullptr) {
+            std::memset(full_px_, 0, (size_t)root_w_ * root_h_ * 2);
+            MakeRgbDsc(&full_dsc_, full_px_, root_w_, root_h_);
+        }
+
+        pip_img_ = lv_image_create(pip_box_);
+        if (pip_px_ != nullptr) lv_image_set_src(pip_img_, &pip_dsc_);
+        lv_obj_center(pip_img_);
+        lv_obj_remove_flag(pip_img_, LV_OBJ_FLAG_CLICKABLE);
+
+        pip_label_ = lv_label_create(pip_box_);
+        lv_label_set_text(pip_label_, "");
+        lv_obj_align(pip_label_, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+        lv_obj_set_style_text_color(pip_label_, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_remove_flag(pip_label_, LV_OBJ_FLAG_CLICKABLE);
+
+        pip_close_ = lv_btn_create(pip_box_);
+        lv_obj_set_size(pip_close_, 28, 28);
+        lv_obj_align(pip_close_, LV_ALIGN_TOP_RIGHT, -4, 4);
+        lv_obj_set_style_radius(pip_close_, 14, 0);
+        lv_obj_set_style_bg_color(pip_close_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(pip_close_, LV_OPA_70, 0);
+        lv_obj_t* xlbl = lv_label_create(pip_close_);
+        lv_label_set_text(xlbl, "x");
+        lv_obj_center(xlbl);
+        lv_obj_set_style_text_color(xlbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_remove_flag(xlbl, LV_OBJ_FLAG_CLICKABLE);
+
+        cam_full_ = lv_image_create(layout_root_);
+        if (full_px_ != nullptr) lv_image_set_src(cam_full_, &full_dsc_);
+        lv_obj_set_pos(cam_full_, 0, 0);
+        lv_obj_add_flag(cam_full_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(cam_full_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_move_background(cam_full_);
+
+        lv_obj_add_flag(pip_box_, LV_OBJ_FLAG_HIDDEN);
+        if (qibao::CameraWatchOn()) {
+            ApplyCameraMode();
+        }
+        ESP_LOGI(TAG, "摄像头按钮在右上角，小窗 %dx%d", pip_w_, pip_h_);
     }
 
     // 点旋转按钮 → 整个画面转 90°
