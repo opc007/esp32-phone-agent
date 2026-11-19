@@ -394,7 +394,7 @@ float* extract_feature(uint8_t* rgb, int img_w, int img_h, int feature_length) {
 
     std::list<dl::detect::result_t>& detections = g_detector->run(image);
     if (detections.empty()) {
-        ESP_LOGI(TAG, "No face detected");
+        ESP_LOGD(TAG, "No face detected");
         return nullptr;
     }
     // 选最大的人脸
@@ -845,7 +845,12 @@ void CameraTask(void*) {
             rgb = nullptr;
         }
         const int64_t now = esp_timer_get_time();
-        if (g_watch.frame != nullptr && now - g_watch.last_recog_us > 1500000) {
+        const auto talk = Application::GetInstance().GetDeviceState();
+        const bool talking = talk == kDeviceStateListening || talk == kDeviceStateSpeaking;
+        const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        // 对话进行中、或内部内存太紧时不跑人脸网络，把核和内存留给麦克和喇叭。
+        if (!talking && internal_free > 48 * 1024 && g_watch.frame != nullptr &&
+            now - g_watch.last_recog_us > 2000000) {
             g_watch.last_recog_us = now;
             uint8_t* copy = nullptr;
             int cw = 0, ch = 0;
@@ -870,7 +875,7 @@ void CameraTask(void*) {
             ObserveFace(SeenFace::None);
         }
         heap_caps_free(rgb);
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
     if (g_watch.mu != nullptr) {
         xSemaphoreTake(g_watch.mu, portMAX_DELAY);
@@ -900,7 +905,7 @@ void SetCameraWatch(bool on) {
         g_watch.pending_count = 0;
         g_watch.last_face_us = 0;
         g_watch.last_recog_us = 0;
-        if (xTaskCreate(CameraTask, "qibao_cam", 20480, nullptr, 2, &g_watch.task) != pdPASS) {
+        if (xTaskCreate(CameraTask, "qibao_cam", 16384, nullptr, 1, &g_watch.task) != pdPASS) {
             g_watch.on = false;
             ESP_LOGE(TAG, "摄像头预览任务没起来，先保语音");
         } else {
@@ -949,6 +954,10 @@ void ShowLivePreview(bool on) {
 
 void StartBridge() {
     Start();  // 初始化人脸 + 载入 NVS 特征
+    // 这块板的实时画面自己画。自带的半屏静帧会整屏花、再变黑，而且每次抓帧都重画。
+    if (Camera* cam = Board::GetInstance().GetCamera()) {
+        static_cast<EspVideo*>(cam)->SetPreviewOnCapture(false);
+    }
 
     // 注册一个 MCP 工具，让大模型能主动查门禁状态/触发刷脸/录入
     auto& mcp = McpServer::GetInstance();

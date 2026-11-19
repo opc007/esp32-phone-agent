@@ -181,37 +181,37 @@ public:
         if (now - last_us < 600000) {
             return;
         }
-        lv_point_t local = {(int32_t)x, (int32_t)y};
-        if (layout_root_ != nullptr) {
-            lv_obj_transform_point(layout_root_, &local, LV_OBJ_POINT_TRANSFORM_FLAG_INVERSE);
-        }
-        auto hit = [&](lv_obj_t* obj) {
+        // 用转完之后的可见区域和物理屏坐标比。
+        // 90° 时布局坐标是负的、转过的，只拿未旋转的 coords 去比，小窗会点不中，
+        // 这一下就掉进开始/结束对话，对调不会发生。
+        auto hit = [&](lv_obj_t* obj, int pad) {
             if (obj == nullptr || lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return false;
             lv_area_t area;
             lv_obj_get_coords(obj, &area);
-            return local.x >= area.x1 && local.x <= area.x2 &&
-                   local.y >= area.y1 && local.y <= area.y2;
+            lv_obj_get_transformed_area(obj, &area, LV_OBJ_POINT_TRANSFORM_FLAG_RECURSIVE);
+            lv_area_increase(&area, pad, pad);
+            return x >= area.x1 && x <= area.x2 && y >= area.y1 && y <= area.y2;
         };
-        if (hit(rotate_btn_)) {
+        if (hit(rotate_btn_, 16)) {
             last_us = now;
             ESP_LOGI(TAG, "轻点落在旋转按钮 (%d,%d)", x, y);
             qibao::ToggleRotation();
             return;
         }
-        if (hit(cam_btn_)) {
+        if (hit(cam_btn_, 12)) {
             last_us = now;
             ESP_LOGI(TAG, "轻点摄像头按钮 (%d,%d)", x, y);
             ToggleCamera();
             return;
         }
-        if (hit(pip_close_)) {
+        if (hit(pip_close_, 8)) {
             last_us = now;
             ESP_LOGI(TAG, "轻点小窗关闭 (%d,%d)", x, y);
             qibao::SetCameraWatch(false);
             ApplyCameraMode();
             return;
         }
-        if (hit(pip_box_)) {
+        if (hit(pip_box_, 20)) {
             last_us = now;
             ESP_LOGI(TAG, "轻点小窗，对调大小 (%d,%d)", x, y);
             qibao::SetCameraWatchLarge(!qibao::CameraWatchLarge());
