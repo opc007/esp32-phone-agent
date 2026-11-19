@@ -16,6 +16,11 @@
 #include "mcp_server.h"
 #include "portal_client.h"
 #include "phone_bridge.h"
+#if MAC_CONTROL_ENABLE
+#include "qibao_screen.h"
+#include "qibao_display.h"
+#include "qibao_persona.h"
+#endif
 
 #define TAG "MacCtrl"
 
@@ -698,6 +703,25 @@ std::string MacControlConsoleCommand(const std::string& cmd,
         return std::string("已设置目标 ") + Portal().Host() +
                (saved ? "（已写入 NVS，重启保留）" : "（NVS 写入失败，仅本次生效）");
     }
+#if MAC_CONTROL_ENABLE
+    if (cmd == "qrotate") {
+        // 整个画面翻转 180°（没有加速度计，只能手动翻）
+        return qibao::ToggleRotation();
+    }
+    if (cmd == "qpose") {
+        // 站姿 / 坐姿手动切换
+        auto* disp = QibaoLcdDisplay::Instance();
+        if (disp == nullptr) return "显示还没初始化，等一会儿再试";
+        disp->SwitchPose();
+        return std::string("已换成") + (disp->CurrentFrame() == 0 ? "站姿" : "坐姿");
+    }
+    if (cmd == "qstatus") {
+        std::string s = qibao::StatusJson();
+        s += "\n屏幕方向: ";
+        s += qibao::RotationName();
+        return s;
+    }
+#endif
     return "";
 }
 

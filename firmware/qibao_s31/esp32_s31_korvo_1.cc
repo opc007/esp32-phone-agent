@@ -5,6 +5,8 @@
 #include "qibao_persona.h"
 #include "qibao_display.h"
 #include "qibao_sdcard.h"
+#include "qibao_screen.h"
+#include "qibao_console.h"
 #endif
 #include "button.h"
 #include "codecs/es8389_audio_codec.h"
@@ -85,6 +87,7 @@ private:
     Button* adc_button_[BSP_ADC_BUTTON_NUM] = {};
     LcdDisplay* display_ = nullptr;
     EspVideo* camera_ = nullptr;
+    esp_lcd_touch_handle_t touch_ = nullptr;
 
     void InitializeCodecI2c() {
         i2c_master_bus_config_t i2c_bus_config = {
@@ -180,6 +183,12 @@ private:
 
         auto mode_button = adc_button_[BSP_ADC_BUTTON_MODE];
         mode_button->OnClick([this]() { Application::GetInstance().ToggleChatState(); });
+#if MAC_CONTROL_ENABLE
+        // 长按 MODE 键 2 秒 → 整个画面翻转 180°（这块板没有加速度计，只能手动翻）
+        mode_button->OnLongPress([this]() {
+            ESP_LOGI(TAG, "长按 MODE：%s", qibao::ToggleRotation().c_str());
+        });
+#endif
     }
 
     void InitializeRgbDisplay() {
@@ -271,6 +280,7 @@ private:
 
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(codec_i2c_bus_, &tp_io_config, &tp_io_handle));
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_gt1151(tp_io_handle, &tp_cfg, &tp));
+        touch_ = tp;
 
         const lvgl_port_touch_cfg_t touch_cfg = {
             .disp = lv_display_get_default(),
@@ -328,6 +338,10 @@ public:
         InitializeButtons();
         InitializeRgbDisplay();
         InitializeTouch();
+#if MAC_CONTROL_ENABLE
+        // 屏幕方向：恢复上次保存的 0°/180°，并把触摸坐标和画面绑定起来
+        qibao::InitScreen(touch_);
+#endif
         InitializeCamera();
 #if MAC_CONTROL_ENABLE
         // 设备端 MCP 工具：走小智原生语音通道，WiFi 控制这台 Mac
@@ -336,6 +350,8 @@ public:
         qibao_sd::Init();
         qibao::StartBridge();
 #endif
+        // 串口控制台：help / qrotate / qpose / qstatus / qshot / wifiset <ssid> <密码>
+        StartQibaoConsole();
     }
 
     AudioCodec* GetAudioCodec() override {

@@ -25,6 +25,11 @@ CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1536
 # LVGL Graphics
 CONFIG_LV_USE_SNAPSHOT=y
 
+# 屏幕方向：注意**不要**开 CONFIG_LV_USE_MATRIX / CONFIG_LV_DRAW_TRANSFORM_USE_MATRIX。
+# 开了之后 LVGL 走「矩阵」那条变换路径，但本项目用的是纯软件渲染器（LV_DRAW_SW），
+# 它根本不消费绘制任务的矩阵，画面根本不会跟着转（实测：校验和不变）。
+# 对象级变换（transform_rotation）在矩阵关闭时走的才是软件渲染器支持的那条路。
+
 # 板型：这块板是 ESP32-S31-Korvo-1，音频 codec 是 ES8389。
 # 必须显式锁定，否则 Kconfig 默认会选 FUNCTION_COREBOARD_1（ES8311），
 # 启动时写 ES8311 I2C 寄存器失败 -> ESP_ERR_NOT_ALLOWED -> 无限重启。

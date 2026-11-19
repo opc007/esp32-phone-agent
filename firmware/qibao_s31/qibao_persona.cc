@@ -36,6 +36,7 @@
 #include "board.h"
 #include "esp_video.h"
 #include "jpg/jpeg_to_image.h"
+#include "qibao_owner_ref.h"  // 岗哥本人照片裁出的两帧（设备端解码后提特征）
 
 static const char* TAG = "Qibao";
 
@@ -56,6 +57,7 @@ constexpr float kEnrollmentConsistencyThreshold = 0.60F;
 constexpr const char* kNvsNamespace = "qibao_face";
 constexpr const char* kNvsKeyFeat = "owner_feat";
 constexpr const char* kNvsKeyLen = "owner_len";
+constexpr const char* kNvsKeyHuman = "human_enrolled";  // 1=已用摄像头录过真人，开机不再用照片覆盖
 
 SemaphoreHandle_t g_mutex = nullptr;
 bool g_initialized = false;
@@ -160,8 +162,61 @@ bool SaveOwnerFeature(const float* feat, int len) {
     return true;
 }
 
-// 抓一帧摄像头 JPEG 并解码成 320x240 RGB565LE，返回解码后的图像缓冲（调用方释放）
-uint8_t* capture_rgb565(size_t* out_size) {
+// 是否已用摄像头录入过真人（照片录入不算）
+bool IsHumanEnrolled() {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READONLY, &handle);
+    if (err != ESP_OK) return false;
+    int32_t flag = 0;
+    err = nvs_get_i32(handle, kNvsKeyHuman, &flag);
+    nvs_close(handle);
+    return err == ESP_OK && flag == 1;
+}
+
+// 标记"已真人录入"，之后开机不再用照片覆盖用户的真实特征
+void MarkHumanEnrolled() {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return;
+    nvs_set_i32(handle, kNvsKeyHuman, 1);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+// 通用：把一段 JPEG 解码成"紧密排列"的 RGB565LE，输出实际宽高（模型要求 row_step=width*2）。
+// 返回缓冲由调用方用 heap_caps_free 释放。
+uint8_t* decode_jpeg_tight(const uint8_t* jpeg, size_t jpeg_len, int* out_w, int* out_h) {
+    uint8_t* out = nullptr;
+    size_t out_len = 0, width = 0, height = 0, stride = 0;
+    esp_err_t err = jpeg_to_image_fit(jpeg, jpeg_len, kWorkWidth, kWorkHeight,
+                                      &out, &out_len, &width, &height, &stride);
+    if (err != ESP_OK || out == nullptr) {
+        ESP_LOGE(TAG, "JPEG decode failed: %s", esp_err_to_name(err));
+        return nullptr;
+    }
+    uint8_t* tight = out;
+    if (stride != width * 2) {
+        // 硬件解码器可能带行对齐 padding，去掉后模型才能按紧密排列读取
+        tight = (uint8_t*)heap_caps_malloc(width * height * 2,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (tight == nullptr) {
+            heap_caps_free(out);
+            return nullptr;
+        }
+        for (size_t y = 0; y < height; ++y) {
+            std::memcpy(tight + y * width * 2, out + y * stride, width * 2);
+        }
+        heap_caps_free(out);
+    }
+    *out_w = (int)width;
+    *out_h = (int)height;
+    ESP_LOGI(TAG, "Decoded JPEG to %ux%u (stride=%u, tight)", (unsigned)width,
+             (unsigned)height, (unsigned)stride);
+    return tight;
+}
+
+// 抓一帧摄像头 JPEG 并解码成紧密 RGB565LE，返回缓冲（调用方释放）
+uint8_t* capture_rgb565(int* out_w, int* out_h) {
     Camera* cam = Board::GetInstance().GetCamera();
     if (cam == nullptr) {
         ESP_LOGE(TAG, "No camera available");
@@ -181,27 +236,15 @@ uint8_t* capture_rgb565(size_t* out_size) {
     }
     ESP_LOGI(TAG, "Captured JPEG: %u bytes, %ux%u", (unsigned)jpeg_len,
              video->GetFrameWidth(), video->GetFrameHeight());
-
-    uint8_t* out = nullptr;
-    size_t out_len = 0, width = 0, height = 0, stride = 0;
-    esp_err_t err = jpeg_to_image_fit(jpeg, jpeg_len, kWorkWidth, kWorkHeight,
-                                      &out, &out_len, &width, &height, &stride);
-    if (err != ESP_OK || out == nullptr) {
-        ESP_LOGE(TAG, "JPEG decode failed: %s", esp_err_to_name(err));
-        return nullptr;
-    }
-    ESP_LOGI(TAG, "Decoded to %ux%u stride=%u len=%u", (unsigned)width,
-             (unsigned)height, (unsigned)stride, (unsigned)out_len);
-    *out_size = out_len;
-    return out;
+    return decode_jpeg_tight(jpeg, jpeg_len, out_w, out_h);
 }
 
 // 用最大的人脸关键点提特征，返回新分配的特征数组（调用方释放）
-float* extract_feature(uint8_t* rgb, int feature_length) {
+float* extract_feature(uint8_t* rgb, int img_w, int img_h, int feature_length) {
     dl::image::img_t image = {};
     image.data = rgb;
-    image.width = kWorkWidth;
-    image.height = kWorkHeight;
+    image.width = (uint16_t)img_w;
+    image.height = (uint16_t)img_h;
     image.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
 
     std::list<dl::detect::result_t>& detections = g_detector->run(image);
@@ -231,6 +274,53 @@ float* extract_feature(uint8_t* rgb, int feature_length) {
     return feat;
 }
 
+// 从一段内置 JPG 提特征（不走摄像头，用于开机录入/自检）
+float* feature_from_jpeg(const unsigned char* jpg, size_t len, int feat_len) {
+    int w = 0, h = 0;
+    uint8_t* rgb = decode_jpeg_tight(jpg, len, &w, &h);
+    if (rgb == nullptr) return nullptr;
+    float* feat = extract_feature(rgb, w, h, feat_len);
+    heap_caps_free(rgb);
+    return feat;
+}
+
+// 用岗哥照片自动录入 + 自检。返回是否在日志里验证了"同一人被认出"。
+bool EnrollFromReferenceAndSelfTest() {
+    if (g_feature_model == nullptr || g_detector == nullptr || !g_initialized) return false;
+    const int feat_len = g_feature_model->get_feat_len();
+
+    // 1) 用 enroll 帧录入
+    float* enroll = feature_from_jpeg(qibao_owner_enroll_jpg,
+                                      sizeof(qibao_owner_enroll_jpg), feat_len);
+    if (enroll == nullptr) {
+        ESP_LOGE(TAG, "参考帧(enroll)未检到人脸，自动录入失败");
+        return false;
+    }
+    ESP_LOGI(TAG, "从岗哥照片提取到人脸特征（%d 维）", feat_len);
+
+    // 2) 用 verify 帧（不同取景）自检：同一人相似度应明显高于阈值
+    float* probe = feature_from_jpeg(qibao_owner_verify_jpg,
+                                     sizeof(qibao_owner_verify_jpg), feat_len);
+    float sim = -1.0F;
+    if (probe != nullptr) {
+        sim = dot_product(enroll, probe, feat_len);
+        heap_caps_free(probe);
+    }
+
+    // 3) 录入（保存主人特征，门禁从此生效）
+    bool saved = SaveOwnerFeature(enroll, feat_len);
+    heap_caps_free(enroll);
+
+    if (sim >= 0) {
+        ESP_LOGI(TAG, "【七宝自检】用岗哥另一张不同取景的照片比对，相似度=%.3f（阈值 %.2f）=> %s",
+                 sim, kRecognitionThreshold,
+                 sim >= kRecognitionThreshold ? "认出是岗哥 ✓" : "未达阈值 ✗");
+        g_last_similarity = sim;
+    }
+    ESP_LOGI(TAG, "岗哥人脸已由照片录入（%s），门禁已生效", saved ? "成功" : "保存失败");
+    return saved && sim >= kRecognitionThreshold;
+}
+
 }  // namespace
 
 void Start() {
@@ -256,6 +346,14 @@ void Start() {
     g_initialized = true;
     ESP_LOGI(TAG, "七宝人脸模块就绪，特征维度 %d，已录入=%d", feat_len,
              g_owner_feature_len > 0 ? 1 : 0);
+
+    // 只要还没用摄像头录过真人，开机就用岗哥照片重新录入并自检。
+    // 这样设备一上电就"认识"岗哥，不需要本人先站到镜头前录 3 张；
+    // 也会覆盖掉 TF 卡里可能残留的来路不明的特征，保证门禁基准一定来自本人照片。
+    // 一旦用户日后通过 action=enroll 用摄像头录入真人，置标记，之后开机不再覆盖。
+    if (!IsHumanEnrolled()) {
+        EnrollFromReferenceAndSelfTest();
+    }
 }
 
 bool HasOwnerFace() {
@@ -284,11 +382,11 @@ Identity VerifyFace(bool blocking) {
     do {
         if (g_feature_model == nullptr || g_detector == nullptr) break;
         const int feat_len = g_feature_model->get_feat_len();
-        size_t decoded_len = 0;
-        uint8_t* rgb = capture_rgb565(&decoded_len);
+        int img_w = 0, img_h = 0;
+        uint8_t* rgb = capture_rgb565(&img_w, &img_h);
         if (rgb == nullptr) break;
 
-        float* feat = extract_feature(rgb, feat_len);
+        float* feat = extract_feature(rgb, img_w, img_h, feat_len);
         heap_caps_free(rgb);
         if (feat == nullptr) break;
 
@@ -328,10 +426,10 @@ bool EnrollOwnerFace(uint8_t samples, bool blocking) {
     if (sum != nullptr) {
         uint8_t collected = 0;
         for (uint8_t i = 0; i < samples; ++i) {
-            size_t decoded_len = 0;
-            uint8_t* rgb = capture_rgb565(&decoded_len);
+            int img_w = 0, img_h = 0;
+            uint8_t* rgb = capture_rgb565(&img_w, &img_h);
             if (rgb == nullptr) { vTaskDelay(pdMS_TO_TICKS(300)); continue; }
-            float* feat = extract_feature(rgb, feat_len);
+            float* feat = extract_feature(rgb, img_w, img_h, feat_len);
             heap_caps_free(rgb);
             if (feat == nullptr) { vTaskDelay(pdMS_TO_TICKS(300)); continue; }
             // 一致性检查：后续样本要和第一张像，避免把别人录进来
@@ -355,6 +453,9 @@ bool EnrollOwnerFace(uint8_t samples, bool blocking) {
             for (int k = 0; k < feat_len; ++k) sum[k] /= (float)collected;
             normalize_vector(sum, feat_len);
             success = SaveOwnerFeature(sum, feat_len);
+            if (success) {
+                MarkHumanEnrolled();  // 真人特征优先，之后开机不再被照片覆盖
+            }
         }
         heap_caps_free(sum);
     }
@@ -459,6 +560,7 @@ void StartBridge() {
         "action=status 查询是否已录入主人人脸、当前是否解锁（解锁10分钟内有效）；\n"
         "action=verify 立即抓拍摄像头刷脸，认出岗哥则解锁10分钟；\n"
         "action=enroll 录入主人人脸（连续抓3张，请岗哥正对镜头）；\n"
+        "action=relearn 用内置的岗哥照片重新学习并自检（无需本人站到镜头前）；\n"
         "action=clear 清除已录入的人脸。\n"
         "当用户说「录入人脸」「刷脸解锁」「你认得我吗」「谁是你的主人」时调用本工具。",
         PropertyList({
@@ -478,6 +580,10 @@ void StartBridge() {
                 bool ok = EnrollOwnerFace(3, true);
                 return ok ? std::string("岗哥的人脸录入成功，以后七宝认得你啦！")
                           : std::string("录入失败，请确保只有岗哥一人正对镜头、光线充足。");
+            } else if (action == "relearn") {
+                bool ok = EnrollFromReferenceAndSelfTest();
+                return ok ? std::string("用岗哥照片重新学习并自检通过，七宝认得你啦！")
+                          : std::string("照片自检未通过，请看串口日志里的相似度。");
             } else if (action == "clear") {
                 ClearOwnerFace();
                 return std::string("已清除人脸库。");
