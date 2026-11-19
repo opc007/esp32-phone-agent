@@ -153,6 +153,28 @@ public:
     static QibaoLcdDisplay* Instance() { return s_instance_; }
 
     // GT1151 直接报上来的按下。不经过会跟着画面旋转的 LVGL 热区。
+    // 给语音工具用：摄像头任务已经改好开关之后，把右上角小窗显示出来。
+    void SyncCameraChrome() {
+        DisplayLockGuard lock(this);
+        ApplyCameraMode();
+    }
+
+    // 小智自带的 self.camera.take_photo 会把一张半屏静帧铺到画面中间。
+    // 这块 SC101IOT 是 UYVY，那张静帧不是右上角实时小窗，用户看到的是一块黑的。
+    // 这里直接丢掉，不让它盖住七宝。实时画面由 self.qibao.camera 打开。
+    void SetPreviewImage(std::unique_ptr<LvglImage> image) override {
+        DisplayLockGuard lock(this);
+        if (preview_image_ != nullptr) {
+            lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (preview_timer_ != nullptr) {
+            esp_timer_stop(preview_timer_);
+        }
+        image.reset();
+        preview_image_cached_.reset();
+        ESP_LOGI(TAG, "丢掉拍照静帧，不显示半屏黑块");
+    }
+
     void HandlePhysicalTap(int x, int y) {
         static int64_t last_us = 0;
         const int64_t now = esp_timer_get_time();

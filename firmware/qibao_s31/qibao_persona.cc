@@ -30,6 +30,7 @@
 
 #include "mcp_server.h"
 #include "application.h"
+#include "qibao_display.h"
 #include "dl_image_define.hpp"
 #include "human_face_detect.hpp"
 #include "human_face_recognition.hpp"
@@ -326,6 +327,7 @@ uint8_t* capture_rgb565(int* out_w, int* out_h, bool quiet = false) {
     }
     // ESP-IDF 默认 -fno-rtti，不能用 dynamic_cast；这块板上 GetCamera() 一定是 EspVideo。
     auto* video = static_cast<EspVideo*>(cam);
+    video->SetPreviewOnCapture(false);
     if (!cam->Capture()) {
         ESP_LOGE(TAG, "Camera capture failed");
         return nullptr;
@@ -890,6 +892,9 @@ void SetCameraWatch(bool on) {
             return;
         }
         if (g_watch.mu == nullptr) g_watch.mu = xSemaphoreCreateMutex();
+        if (Camera* cam = Board::GetInstance().GetCamera()) {
+            static_cast<EspVideo*>(cam)->SetPreviewOnCapture(false);
+        }
         g_watch.on = true;
         g_watch.shown = SeenFace::None;
         g_watch.pending_count = 0;
@@ -932,6 +937,14 @@ const char* ViewerBadge() {
 
 std::string ViewerInstruction() {
     return InstructionFor(g_watch.on ? g_watch.shown : SeenFace::None, g_watch.on);
+}
+
+void ShowLivePreview(bool on) {
+    SetCameraWatch(on);
+    if (QibaoLcdDisplay* view = QibaoLcdDisplay::Instance()) {
+        view->SyncCameraChrome();
+    }
+    ESP_LOGI(TAG, "实时预览 %s（和点右上角相机按钮是同一条）", on ? "开" : "关");
 }
 
 void StartBridge() {
@@ -990,9 +1003,42 @@ void StartBridge() {
             return ViewerInstruction();
         });
     ESP_LOGI(TAG, "七宝语气工具已注册：self.qibao.viewer");
+
+    mcp.AddTool(
+        "self.qibao.camera",
+        "打开或关闭实时摄像头。用户说打开摄像头、关掉摄像头、视频通话时调用本工具，"
+        "不要改用 self.camera.take_photo。\n"
+        "action=open：七宝仍占大画面，右上角出现摄像头实时小窗。\n"
+        "action=close：关闭摄像头。\n"
+        "action=status：查询开没开。\n"
+        "这是和屏幕右上角相机按钮相同的实时画面，不是拍一张照片。",
+        PropertyList({
+            Property("action", kPropertyTypeString, std::string("open")).SetMaxLength(16),
+        }),
+        [](const PropertyList& p) -> ReturnValue {
+            std::string action = p["action"].value<std::string>();
+            if (action == "close") {
+                ShowLivePreview(false);
+                return std::string("摄像头已关闭");
+            }
+            if (action == "status") {
+                return CameraWatchOn() ? std::string("摄像头开着，右上角是实时小窗")
+                                       : std::string("摄像头关着");
+            }
+            ShowLivePreview(true);
+            return CameraWatchOn() ? std::string("实时画面已打开：七宝在大画面，摄像头在右上角小窗")
+                                   : std::string("实时画面没打开，预览任务没有起来");
+        });
+    ESP_LOGI(TAG, "实时摄像头工具已注册：self.qibao.camera");
 }
 
 }  // namespace qibao
+
+// self.camera.take_photo 讲解完这一帧之后调用。
+// 打开的是和屏幕按钮同一条实时小窗，不再铺半屏静帧。
+void QibaoOnPhotoTool() {
+    qibao::ShowLivePreview(true);
+}
 
 // ---- 给 application.cc 的 C 弱符号实现 ----
 extern "C" bool QibaoGateAllowed(const char* command) {
