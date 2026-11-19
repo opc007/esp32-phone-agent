@@ -221,6 +221,7 @@ private:
     FrameSet frames_[2];  // [0]=横屏(480 高)  [1]=竖屏(800 高)
 
     lv_obj_t* layout_root_ = nullptr;  // 布局根容器（整套界面挂在它下面）
+    lv_obj_t* talk_hit_ = nullptr;     // 贴在物理屏上的轻点层，不跟布局一起转
     int root_w_ = 0;
     int root_h_ = 0;
     lv_obj_t* imgs_[2] = {nullptr, nullptr};
@@ -267,6 +268,10 @@ private:
         imgs_[0] = nullptr;
         imgs_[1] = nullptr;
         rotate_btn_ = nullptr;
+        if (talk_hit_ != nullptr) {
+            lv_obj_del(talk_hit_);
+            talk_hit_ = nullptr;
+        }
         lv_obj_del(layout_root_);
         layout_root_ = nullptr;
         qibao::SetLayoutRootHandle(nullptr);
@@ -377,36 +382,72 @@ private:
         return fs.ok[0] || fs.ok[1];
     }
 
-    // 轻点画面 → 和七宝开始或结束这一轮对话（等同短按 MODE，不用找按键）
-    static void OnScreenTapped(lv_event_t* e) {
-        (void)e;
+    // 手指点在旋转按钮的可见位置上吗？
+    // 按钮画在已经旋转的布局里，触摸点是物理屏坐标，要先按布局的逆变换换算。
+    bool HitsRotateButton(lv_point_t screen_pt) const {
+        if (rotate_btn_ == nullptr || layout_root_ == nullptr) {
+            return false;
+        }
+        lv_obj_transform_point(layout_root_, &screen_pt, LV_OBJ_POINT_TRANSFORM_FLAG_INVERSE);
+        lv_area_t area;
+        lv_obj_get_coords(rotate_btn_, &area);
+        lv_area_increase(&area, 16, 16);
+        return screen_pt.x >= area.x1 && screen_pt.x <= area.x2 &&
+               screen_pt.y >= area.y1 && screen_pt.y <= area.y2;
+    }
+
+    // 轻点物理屏 → 和七宝开始或结束这一轮对话（等同短按 BOOT/MODE、串口 qtalk）。
+    // 用 PRESSED 而不是 CLICKED：点一下就开口，不要求按下和松开还落在同一个旋转后的控件上。
+    static void OnScreenPressed(lv_event_t* e) {
+        if (lv_event_get_code(e) != LV_EVENT_PRESSED) {
+            return;
+        }
+        auto* self = static_cast<QibaoLcdDisplay*>(lv_event_get_user_data(e));
+        if (self == nullptr) {
+            return;
+        }
         static int64_t last_us = 0;
         const int64_t now = esp_timer_get_time();
         if (now - last_us < 600000) {
             return;
         }
+        lv_point_t p = {0, 0};
+        lv_indev_t* indev = lv_indev_active();
+        if (indev != nullptr) {
+            lv_indev_get_point(indev, &p);
+        }
+        if (self->HitsRotateButton(p)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点落在旋转按钮 (%d,%d)", (int)p.x, (int)p.y);
+            qibao::ToggleRotation();
+            return;
+        }
         last_us = now;
-        ESP_LOGI(TAG, "轻触屏幕：和七宝开始/结束对话");
+        ESP_LOGI(TAG, "轻触屏幕 (%d,%d)：和七宝开始/结束对话", (int)p.x, (int)p.y);
         Application::GetInstance().ToggleChatState();
     }
 
-    // 透明全屏层盖在人物图上，专门接轻点。旋转按钮之后会被挪到它上面。
+    // 轻点层贴在物理屏（800x480）上，不放进会旋转的布局根。
+    // 上一版把透明层放进布局根：竖屏时布局是 480x800 再转 90°，
+    // 触摸仍是物理屏坐标，热区和手指对不上，CLICKED 根本不会进 ToggleChatState。
+    // 串口 qtalk 不经过这块热区，所以只有它能进 listening。
     void CreateTalkLayer() {
-        if (layout_root_ == nullptr) {
-            return;
+        if (talk_hit_ != nullptr) {
+            lv_obj_del(talk_hit_);
+            talk_hit_ = nullptr;
         }
-        lv_obj_t* hit = lv_obj_create(layout_root_);
-        lv_obj_set_size(hit, LV_PCT(100), LV_PCT(100));
-        lv_obj_align(hit, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_style_bg_opa(hit, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(hit, 0, 0);
-        lv_obj_set_style_pad_all(hit, 0, 0);
-        lv_obj_clear_flag(hit, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(hit, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(hit, OnScreenTapped, LV_EVENT_CLICKED, this);
-        if (rotate_btn_ != nullptr) {
-            lv_obj_move_foreground(rotate_btn_);
-        }
+        talk_hit_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(talk_hit_, kScreenW, kScreenH);
+        lv_obj_set_pos(talk_hit_, 0, 0);
+        lv_obj_set_style_bg_opa(talk_hit_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(talk_hit_, 0, 0);
+        lv_obj_set_style_pad_all(talk_hit_, 0, 0);
+        lv_obj_set_style_radius(talk_hit_, 0, 0);
+        lv_obj_remove_flag(talk_hit_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(talk_hit_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(talk_hit_, LV_OBJ_FLAG_FLOATING);
+        lv_obj_add_event_cb(talk_hit_, OnScreenPressed, LV_EVENT_PRESSED, this);
+        lv_obj_move_foreground(talk_hit_);
     }
 
     // 点旋转按钮 → 整个画面转 90°
