@@ -177,6 +177,34 @@ void Run(const std::string& raw) {
         ESP_LOGI(TAG, "[CMD] < 已换成%s", disp->CurrentFrame() == 0 ? "站姿" : "坐姿");
         return;
     }
+    if (cmd == "qview") {
+        const bool on = !qibao::CameraWatchOn();
+        qibao::ShowLivePreview(on);
+        ESP_LOGI(TAG, "[CMD] < 实时小窗 %s", on ? "开" : "关");
+        return;
+    }
+    if (cmd == "qhit") {
+        auto* disp = QibaoLcdDisplay::Instance();
+        if (disp == nullptr) {
+            ESP_LOGI(TAG, "[CMD] < 显示还没初始化");
+            return;
+        }
+        disp->LogHitBoxes();
+        return;
+    }
+    if (cmd == "qtap") {
+        if (args.size() < 2) {
+            ESP_LOGI(TAG, "[CMD] < 用法: qtap <x> <y>");
+            return;
+        }
+        auto* disp = QibaoLcdDisplay::Instance();
+        if (disp == nullptr) {
+            ESP_LOGI(TAG, "[CMD] < 显示还没初始化");
+            return;
+        }
+        disp->HandlePhysicalTap(atoi(args[0].c_str()), atoi(args[1].c_str()));
+        return;
+    }
     if (cmd == "qstatus") {
         std::string s = qibao::StatusJson();
         s += "\n屏幕方向: ";

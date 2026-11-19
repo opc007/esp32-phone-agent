@@ -71,6 +71,7 @@ bool CaptureCameraJpeg(std::string& jpeg, int quality = 75);
 
 // ---- 视频小窗（只有用户点开摄像头才跑，开机/唤醒不自动开）----
 void SetCameraWatch(bool on);
+void ShowLivePreview(bool on);
 bool CameraWatchOn();
 bool CameraWatchLarge();
 void SetCameraWatchLarge(bool large);

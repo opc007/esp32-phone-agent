@@ -31,7 +31,7 @@ diff --git a/main/boards/common/esp_video.h b/main/boards/common/esp_video.h
      std::thread encoder_thread_;
 +    // 七宝自己画右上角实时小窗时关掉这里的半屏静帧。
 +    // 那张静帧会占一块大缓冲，失败时整次 Capture 也变成失败，小窗就一直是黑的。
-+    bool preview_on_capture_ = true;
++    bool preview_on_capture_ = false;
  
  public:
      EspVideo(const esp_video_init_config_t& config);

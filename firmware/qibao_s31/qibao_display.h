@@ -154,6 +154,25 @@ public:
 
     // GT1151 直接报上来的按下。不经过会跟着画面旋转的 LVGL 热区。
     // 给语音工具用：摄像头任务已经改好开关之后，把右上角小窗显示出来。
+    void LogHitBoxes() {
+        auto dump = [](const char* name, lv_obj_t* obj) {
+            if (obj == nullptr) {
+                ESP_LOGI(TAG, "热区 %s 不存在", name);
+                return;
+            }
+            lv_area_t area;
+            lv_obj_get_coords(obj, &area);
+            lv_obj_get_transformed_area(obj, &area, LV_OBJ_POINT_TRANSFORM_FLAG_RECURSIVE);
+            ESP_LOGI(TAG, "热区 %s [%ld,%ld]-[%ld,%ld] hidden=%d", name,
+                     (long)area.x1, (long)area.y1, (long)area.x2, (long)area.y2,
+                     lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) ? 1 : 0);
+        };
+        dump("cam", cam_btn_);
+        dump("pip", pip_box_);
+        dump("close", pip_close_);
+        dump("rot", rotate_btn_);
+    }
+
     void SyncCameraChrome() {
         DisplayLockGuard lock(this);
         ApplyCameraMode();
@@ -176,6 +195,7 @@ public:
     }
 
     void HandlePhysicalTap(int x, int y) {
+        DisplayLockGuard lock(this);
         static int64_t last_us = 0;
         const int64_t now = esp_timer_get_time();
         if (now - last_us < 600000) {

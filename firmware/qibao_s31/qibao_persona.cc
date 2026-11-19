@@ -848,8 +848,9 @@ void CameraTask(void*) {
         const auto talk = Application::GetInstance().GetDeviceState();
         const bool talking = talk == kDeviceStateListening || talk == kDeviceStateSpeaking;
         const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        // 对话进行中、或内部内存太紧时不跑人脸网络，把核和内存留给麦克和喇叭。
-        if (!talking && internal_free > 48 * 1024 && g_watch.frame != nullptr &&
+        // 人脸模型一加载就会把内部内存打到只剩十几字节，MQTT 随即 ENOMEM 断开。
+        // 内存不宽裕、或正在对话时，不加载、不推理。
+        if (!talking && internal_free > 120 * 1024 && g_watch.frame != nullptr &&
             now - g_watch.last_recog_us > 2000000) {
             g_watch.last_recog_us = now;
             uint8_t* copy = nullptr;
@@ -954,10 +955,9 @@ void ShowLivePreview(bool on) {
 
 void StartBridge() {
     Start();  // 初始化人脸 + 载入 NVS 特征
-    // 这块板的实时画面自己画。自带的半屏静帧会整屏花、再变黑，而且每次抓帧都重画。
-    if (Camera* cam = Board::GetInstance().GetCamera()) {
-        static_cast<EspVideo*>(cam)->SetPreviewOnCapture(false);
-    }
+    // 不要在这里调用 Board::GetInstance()。本函数就在板子构造函数里，
+    // GetInstance 的静态初始化还没完成，再进去会卡住，Wi-Fi 和语音都起不来。
+    // 半屏静帧默认关闭，见 EspVideo::preview_on_capture_。
 
     // 注册一个 MCP 工具，让大模型能主动查门禁状态/触发刷脸/录入
     auto& mcp = McpServer::GetInstance();
