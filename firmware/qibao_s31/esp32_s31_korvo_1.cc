@@ -22,6 +22,7 @@
 #include <esp_lcd_touch_gt1151.h>
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
+#include <esp_private/esp_cam_dvp.h>
 #include <lvgl.h>
 
 #define TAG "Esp32S31Korvo1"
@@ -328,6 +329,32 @@ private:
         esp_video_init_config_t video_config = {
             .dvp = &dvp_config,
         };
+
+        // 【关键】传感器探测之前必须先把 DVP 的 XCLK 拉起来。
+        //
+        // OV3660 没有主时钟就不应答 SCCB，日志会是
+        //   E ov3660: Get sensor ID failed
+        //   E esp_video_init: Failed to detect camera sensor with address=3c
+        //   E EspVideo: open /dev/video2 failed, errno=2(No such file or directory)
+        // -> 设备节点建不出来，摄像头完全用不了。
+        //
+        // 为什么这里要手动起时钟：esp_video 的**公开** API（esp_video_init）
+        // 没有时钟钩子，XCLK 是在 DVP 控制器起来之后才有的；
+        // 而传感器探测发生在控制器之前。esp_video 内部其实有 init_dvp_clk_func
+        // 这个钩子，但它只接在 board-manager 那条路径上，板级直接调 esp_video_init 用不到。
+        // 所以这里直接调 IDF 的 DVP 时钟 API 把 XCLK 提前拉起来
+        // （官方 BSP 走 board-manager，等价于它帮你做了这件事）。
+        //
+        // 注意：这里只配了 xclk_io，DVP 的数据线/同步线仍然是 NC，
+        // 后面 DVP 控制器初始化时会再配一遍，不冲突。
+        esp_err_t clk_err = esp_cam_ctlr_dvp_start_clock(
+            0, CAMERA_PIN_XCLK, CAM_CLK_SRC_DEFAULT, CAMERA_XCLK_FREQ_HZ);
+        if (clk_err != ESP_OK) {
+            ESP_LOGE(TAG, "DVP XCLK 启动失败: %s", esp_err_to_name(clk_err));
+        } else {
+            ESP_LOGI(TAG, "DVP XCLK 已启动: GPIO%d @ %d Hz", (int)CAMERA_PIN_XCLK,
+                     CAMERA_XCLK_FREQ_HZ);
+        }
 
         camera_ = new EspVideo(video_config);
     }

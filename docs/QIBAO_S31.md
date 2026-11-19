@@ -325,23 +325,68 @@ bash prebuilt/qibao_s31/flash.sh /dev/cu.usbserial-2110 460800
 - **WiFi 已连上 jjhome**，拿到 IP `10.197.1.66`（凭据已在 NVS，重启自动连）。
 - **TF 卡正常**：`TF 卡挂载成功：USD00（400 kHz, 4-bit）` + `读写自检：通过`。
 
-### 已知未解决：摄像头驱动没开（既有问题，与方向无关）
+### 摄像头：驱动已修好，传感器仍不应答（进行中）
 
-`qcam` 抓帧报 `EspVideo: open /dev/video2 failed, errno=2(No such file or directory)` ——
-**DVP 视频设备节点根本没生成**，也就是说这块板上的摄像头从来没通过。
+`qcam` 抓帧仍报 `EspVideo: open /dev/video2 failed, errno=2(No such file or directory)` ——
+**DVP 视频设备节点没生成**。已经修掉两层根因，第三层还在查。
 
-根因：板级 `config.json` 里写了 `"sdkconfig_append": ["CONFIG_CAMERA_OV3660=y"]`，
+**第 1 层（已修）：驱动没编进固件。**
+板级 `config.json` 里写了 `"sdkconfig_append": ["CONFIG_CAMERA_OV3660=y"]`，
 但本工程是用 `sdkconfig.defaults;sdkconfig.defaults.esp32s31` 两个 defaults 文件生成 sdkconfig 的，
 `config.json` 的 `sdkconfig_append` **不在这条路径上生效**，
 最终 sdkconfig 里是 `# CONFIG_CAMERA_OV3660 is not set` → 传感器驱动没编进固件 → DVP 驱动绑不上 → 没有 `/dev/video2`。
+修法：在 `sdkconfig.defaults.esp32s31` 显式写死
 
-修的话要在 `sdkconfig.defaults.esp32s31` 里显式加：
-`CONFIG_CAMERA_OV3660=y` + 选一个 JPEG 输出格式（如 `CONFIG_CAMERA_OV3660_DVP_JPEG_320X240_25FPS=y`）
-+ `CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT=y`（`EspVideo::Capture()` 只在开了这个选项时才走 JPEG 分支，
-而人脸识别那侧要的就是 JPEG 数据）。
+```
+CONFIG_CAMERA_OV3660=y
+CONFIG_CAMERA_OV3660_AUTO_DETECT_DVP_INTERFACE_SENSOR=y
+CONFIG_CAMERA_OV3660_DVP_JPEG_320X240_25FPS=y
+CONFIG_CAMERA_OV3660_DVP_DEFAULT_FMT_JPEG_320X240_25FPS=y
+CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT=y
+```
+
+（最后一条：`EspVideo::Capture()` 只在开了这个时才走 JPEG 分支，而人脸识别那侧要的就是 JPEG 数据。
+输出选 320x240 JPEG 是因为识别侧正好按 320x240 解码，不用再缩放。）
+改完驱动确实编进去了（固件 +6.5KB flash），日志也从「完全没有 ov3660 字样」变成会打印 ov3660 的错误。
+
+**第 2 层（已修）：传感器探测前 XCLK 没输出。**
+OV3660 没有主时钟就不应答 SCCB。esp_video 的**公开** API `esp_video_init()` 没有时钟钩子
+（`esp_video_init_config_t` 里根本没有 `init_clk_func` 字段），
+XCLK 是 DVP 控制器起来之后才有的，而传感器探测发生在控制器**之前**；
+esp_video 内部其实有 `init_dvp_clk_func` 这个钩子，但它只接在 board-manager 那条路径上，
+板级直接调公开 API 用不到。
+修法：板级 `InitializeCamera()` 里、`new EspVideo(video_config)` **之前**手动拉起时钟：
+
+```cpp
+esp_cam_ctlr_dvp_start_clock(0, CAMERA_PIN_XCLK, CAM_CLK_SRC_DEFAULT, CAMERA_XCLK_FREQ_HZ);
+```
+
+头文件是 `#include <esp_private/esp_cam_dvp.h>`（IDF v6.1 的
+`components/esp_driver_cam/dvp/include/esp_private/esp_cam_dvp.h`）。
+现在启动日志能确认时钟起来了：`I DVP XCLK 已启动: GPIO55 @ 20000000 Hz`。
+
+**第 3 层（未解决）：传感器在 SCCB 上不应答。**
+日志停在：`E ov3660: Get sensor ID failed` / `E esp_video_init: Failed to detect camera sensor with address=3c`。
+即 XCLK 正常了，但 OV3660 的 SCCB（地址 0x3c）读 PID 没回 ACK。当前代码里 SCCB 是
+**复用 codec 的 I2C 总线**（`codec_i2c_bus_`，SDA=GPIO0 / SCL=GPIO1，10kHz），
+同一总线上还挂着 ES8389 和 GT1151 触摸。
+
+下一步候选（按性价比）：
+1. 官方 esp-bsp 给 esp32-s31-korvo-1 的摄像头 SCCB 用的是不是 GPIO0/GPIO1（可能是专用引脚）；
+   参考可跑通工程 `gitee.com/stonetan/esp32-s31-cam`（日志有 `Detected Camera sensor PID=0x3660`）。
+2. 官方 BSP 同时开了 `CONFIG_CAMERA_SC101IOT`（SCCB 地址 0x68，与 OV3660 的 0x3c 不同）—— 板上模组可能是它。
+3. XCLK 拉起后加 50~100ms 延时再探测（传感器上电稳定时间）。
+4. 换独立 I2C 控制器跑 SCCB（不与 codec/触摸共用），或把 SCCB 频率提到 100kHz。
 
 在修好之前：**开机用照片认人是好的（走的是固件内置照片，不碰摄像头），
 但「站到镜头前刷脸开门」是不通的**。
+
+### 顺带修掉的一个编译坑
+
+`ESP_LOGx(tag, format, ...)` 少写 `tag` 会报一堆看不懂的错：
+`expected ')' before 'GPIO_NUM_55'` / `expected ')' before 'esp_err_to_name'`。
+因为第一个参数会被当成 tag，真正的 format 变成了 `GPIO_NUM_55`，
+再套进 `LOG_FORMAT()` 宏里就成了非法表达式。**写日志一律带 TAG。**
 
 ## 待办 / 需用户本人操作
 
@@ -359,9 +404,9 @@ bash prebuilt/qibao_s31/flash.sh /dev/cu.usbserial-2110 460800
    依次是「横屏正向 → 竖屏（人物侧躺 90°，设备逆时针拿正立）→ 横屏倒置 → 竖屏（反方向）」。
    竖屏挡时人物图会满高铺满画面、状态栏在顶、字幕条在底，按着不放别松手，
    顺手确认一下触摸位置也跟着对（点图片换姿势、点左下角按钮转方向）。
-4. **摄像头刷脸还打不通**：驱动没编进固件（见上面「已知未解决」），
-   需要把 `CONFIG_CAMERA_OV3660=y` 等几项加进 `sdkconfig.defaults.esp32s31` 重新编译。
-   在那之前只有「开机用照片认人」是通的。
+4. **摄像头刷脸还打不通**：驱动和 XCLK 都已修好（见上面「摄像头」章节），
+   现在卡在传感器 SCCB 不应答 —— 需要查官方 BSP 的 SCCB 接线 / 是否其实是 SC101IOT(0x68) /
+   上电延时。在那之前只有「开机用照片认人」是通的，「站到镜头前刷脸开门」还不通。
 5. **形象图更多互动表情**（说话高亮、开心/生气切换）可在 `qibao_display.h` 的 `SetupUI()` 基础上扩展。
 
 
