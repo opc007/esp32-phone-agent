@@ -26,6 +26,37 @@ Rotation s_rotation = Rotation::kNormal;
 bool s_loaded = false;
 RotationChangedCallback s_rotation_cb = nullptr;
 lv_obj_t* s_layout_root = nullptr;
+esp_lcd_touch_handle_t s_touch = nullptr;
+PhysicalTapCallback s_tap_cb = nullptr;
+bool s_touch_down = false;
+
+void TouchPollCb(lv_timer_t*) {
+    if (s_touch == nullptr) {
+        return;
+    }
+    const esp_err_t read_err = esp_lcd_touch_read_data(s_touch);
+    if (read_err != ESP_OK) {
+        static bool logged = false;
+        if (!logged) {
+            ESP_LOGW(TAG, "读 GT1151 失败: %s", esp_err_to_name(read_err));
+            logged = true;
+        }
+        return;
+    }
+    esp_lcd_touch_point_data_t point = {};
+    uint8_t count = 0;
+    if (esp_lcd_touch_get_data(s_touch, &point, &count, 1) != ESP_OK) {
+        return;
+    }
+    const bool down = count > 0;
+    if (down && !s_touch_down) {
+        ESP_LOGI(TAG, "GT1151 按下 x=%u y=%u", point.x, point.y);
+        if (s_tap_cb != nullptr) {
+            s_tap_cb(point.x, point.y);
+        }
+    }
+    s_touch_down = down;
+}
 
 // 翻转后要补画几次整屏（见 ScheduleFullRedraw 里的说明）
 int s_full_redraw_left = 0;
@@ -301,15 +332,23 @@ void ProbeFrame() {
     ProbeFrameInternal();
 }
 
+void SetPhysicalTapCallback(PhysicalTapCallback cb) {
+    s_tap_cb = cb;
+}
+
 void InitScreen(esp_lcd_touch_handle_t touch) {
-    // touch 句柄保留在签名里是为了以后要用；当前方案不需要驱动层镜像
-    // （LVGL 命中判定自带逆变换，触摸自动跟着方向走）。
-    (void)touch;
     s_disp = lv_display_get_default();
     if (s_disp == nullptr) {
         ESP_LOGE(TAG, "没有默认显示，屏幕方向功能不可用");
     }
     EnsureLoaded();
+    // 直接轮询触摸芯片。LVGL 的点击层跟着布局旋转后，热区和手指对不上，
+    // 点屏幕不会进对话。这里不靠那层控件，手指按下就通知显示层。
+    if (touch != nullptr && s_touch == nullptr) {
+        s_touch = touch;
+        lv_timer_create(TouchPollCb, 20, nullptr);
+        ESP_LOGI(TAG, "触摸轮询已开：轻点屏幕即和七宝对话");
+    }
 }
 
 void ScheduleFullRedraw() {

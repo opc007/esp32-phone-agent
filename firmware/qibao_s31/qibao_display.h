@@ -79,7 +79,12 @@ public:
         ApplyBackdrop();                   // 米灰渐变背景 + 让原生容器透明
         CreatePersonaImages();             // 人物图（解码结果按朝向缓存，不重复解码）
         CreateRotateButton();              // 左下角旋转按钮
-        CreateTalkLayer();                 // 盖住画面的透明层：轻点即对话，旋转按钮留在最上面
+        CreateTalkLayer();                 // 备用：物理屏上的透明层
+        qibao::SetPhysicalTapCallback([](int x, int y) {
+            if (QibaoLcdDisplay* self = QibaoLcdDisplay::Instance()) {
+                self->HandlePhysicalTap(x, y);
+            }
+        });
 
         // 【关键】界面建完了，现在才能安全地套上旋转变换。
         // 原因见 qibao_screen.h 的说明 6：界面没建就设 transform，
@@ -143,6 +148,25 @@ public:
 
     // 当前实例（串口命令 qpose 用）
     static QibaoLcdDisplay* Instance() { return s_instance_; }
+
+    // GT1151 直接报上来的按下。不经过会跟着画面旋转的 LVGL 热区。
+    void HandlePhysicalTap(int x, int y) {
+        static int64_t last_us = 0;
+        const int64_t now = esp_timer_get_time();
+        if (now - last_us < 600000) {
+            return;
+        }
+        lv_point_t p = {(int32_t)x, (int32_t)y};
+        if (HitsRotateButton(p)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点落在旋转按钮 (%d,%d)", x, y);
+            qibao::ToggleRotation();
+            return;
+        }
+        last_us = now;
+        ESP_LOGI(TAG, "轻触屏幕 (%d,%d)：和七宝开始/结束对话", x, y);
+        Application::GetInstance().ToggleChatState();
+    }
 
     // ---------------------------------------------------------------------------
     // 忠实快照：直接读「正在送显的那块缓冲」。
@@ -406,25 +430,12 @@ private:
         if (self == nullptr) {
             return;
         }
-        static int64_t last_us = 0;
-        const int64_t now = esp_timer_get_time();
-        if (now - last_us < 600000) {
-            return;
-        }
         lv_point_t p = {0, 0};
         lv_indev_t* indev = lv_indev_active();
         if (indev != nullptr) {
             lv_indev_get_point(indev, &p);
         }
-        if (self->HitsRotateButton(p)) {
-            last_us = now;
-            ESP_LOGI(TAG, "轻点落在旋转按钮 (%d,%d)", (int)p.x, (int)p.y);
-            qibao::ToggleRotation();
-            return;
-        }
-        last_us = now;
-        ESP_LOGI(TAG, "轻触屏幕 (%d,%d)：和七宝开始/结束对话", (int)p.x, (int)p.y);
-        Application::GetInstance().ToggleChatState();
+        self->HandlePhysicalTap(p.x, p.y);
     }
 
     // 轻点层贴在物理屏（800x480）上，不放进会旋转的布局根。

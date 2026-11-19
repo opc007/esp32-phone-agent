@@ -90,7 +90,12 @@ enum class Rotation {
 };
 
 // 绑定显示控制器，并恢复上次保存的方向。必须在显示初始化完之后调用。
+// touch 用来直接读 GT1151：轻点不走会跟着画面旋转的 LVGL 热区。
 void InitScreen(esp_lcd_touch_handle_t touch);
+
+// 手指按下（物理屏坐标）。由显示层注册，用来开口或转方向。
+using PhysicalTapCallback = void (*)(int x, int y);
+void SetPhysicalTapCallback(PhysicalTapCallback cb);
 
 // 当前方向
 Rotation CurrentRotation();
