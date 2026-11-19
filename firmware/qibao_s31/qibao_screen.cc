@@ -9,6 +9,7 @@
 #include "qibao_screen.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 
@@ -26,36 +27,28 @@ Rotation s_rotation = Rotation::kNormal;
 bool s_loaded = false;
 RotationChangedCallback s_rotation_cb = nullptr;
 lv_obj_t* s_layout_root = nullptr;
-esp_lcd_touch_handle_t s_touch = nullptr;
 PhysicalTapCallback s_tap_cb = nullptr;
-bool s_touch_down = false;
+int64_t s_last_touch_us = 0;
 
-void TouchPollCb(lv_timer_t*) {
-    if (s_touch == nullptr) {
+// 挂在 LVGL 已经读到的那一次坐标上。
+// GT1151 的 read_data 读完会把寄存器清 0。再开一个轮询去读，
+// 会把同一次轻点清掉：LVGL 拿到了，轮询看到 0；或者两边都错过。
+// 串口上就只有「触摸轮询已开」，没有「GT1151 按下」。
+void TouchFromLvgl(esp_lcd_touch_handle_t, uint16_t* x, uint16_t* y, uint16_t*,
+                   uint8_t* point_num, uint8_t) {
+    if (point_num == nullptr || *point_num == 0 || x == nullptr || y == nullptr) {
         return;
     }
-    const esp_err_t read_err = esp_lcd_touch_read_data(s_touch);
-    if (read_err != ESP_OK) {
-        static bool logged = false;
-        if (!logged) {
-            ESP_LOGW(TAG, "读 GT1151 失败: %s", esp_err_to_name(read_err));
-            logged = true;
-        }
+    const int64_t now = esp_timer_get_time();
+    const bool new_press = (s_last_touch_us == 0) || (now - s_last_touch_us > 80000);
+    s_last_touch_us = now;
+    if (!new_press) {
         return;
     }
-    esp_lcd_touch_point_data_t point = {};
-    uint8_t count = 0;
-    if (esp_lcd_touch_get_data(s_touch, &point, &count, 1) != ESP_OK) {
-        return;
+    ESP_LOGI(TAG, "GT1151 按下 x=%u y=%u（与 LVGL 同一次读取）", x[0], y[0]);
+    if (s_tap_cb != nullptr) {
+        s_tap_cb(x[0], y[0]);
     }
-    const bool down = count > 0;
-    if (down && !s_touch_down) {
-        ESP_LOGI(TAG, "GT1151 按下 x=%u y=%u", point.x, point.y);
-        if (s_tap_cb != nullptr) {
-            s_tap_cb(point.x, point.y);
-        }
-    }
-    s_touch_down = down;
 }
 
 // 翻转后要补画几次整屏（见 ScheduleFullRedraw 里的说明）
@@ -342,12 +335,9 @@ void InitScreen(esp_lcd_touch_handle_t touch) {
         ESP_LOGE(TAG, "没有默认显示，屏幕方向功能不可用");
     }
     EnsureLoaded();
-    // 直接轮询触摸芯片。LVGL 的点击层跟着布局旋转后，热区和手指对不上，
-    // 点屏幕不会进对话。这里不靠那层控件，手指按下就通知显示层。
-    if (touch != nullptr && s_touch == nullptr) {
-        s_touch = touch;
-        lv_timer_create(TouchPollCb, 20, nullptr);
-        ESP_LOGI(TAG, "触摸轮询已开：轻点屏幕即和七宝对话");
+    if (touch != nullptr && touch->config.process_coordinates == nullptr) {
+        touch->config.process_coordinates = TouchFromLvgl;
+        ESP_LOGI(TAG, "触摸跟 LVGL 同一次读取：轻点屏幕即和七宝对话");
     }
 }
 
