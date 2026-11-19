@@ -23,6 +23,8 @@
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 #include <esp_private/esp_cam_dvp.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <lvgl.h>
 
 #define TAG "Esp32S31Korvo1"
@@ -355,6 +357,11 @@ private:
             ESP_LOGI(TAG, "DVP XCLK 已启动: GPIO%d @ %d Hz", (int)CAMERA_PIN_XCLK,
                      CAMERA_XCLK_FREQ_HZ);
         }
+
+        // 官方 esp-bsp 的 bsp_camera_start() 就是这个顺序：
+        // 起 XCLK -> 等 20ms 让时钟稳定 -> 再去做 SCCB 探测。
+        // 少了这段延时，传感器刚上电那一下 SCCB 不一定应答。
+        vTaskDelay(pdMS_TO_TICKS(20));
 
         camera_ = new EspVideo(video_config);
     }

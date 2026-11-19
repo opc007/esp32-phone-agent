@@ -122,7 +122,7 @@ void Run(const std::string& raw) {
 
     if (cmd == "help" || cmd == "?") {
         ESP_LOGI(TAG, "[CMD] < help | state | qrotate(转 90°) | qrot <0|90|180|270> | "
-                      "qpose(换姿势) | qstatus | qprobe | qdiag | qshot | qcam | "
+                      "qpose(换姿势) | qstatus | qprobe | qdiag | qshot | qcam | qface(刷脸) | "
                       "wifiset <ssid> <密码> | wifilist | macphone <整句> | macapps | macscreen");
         return;
     }
@@ -215,6 +215,17 @@ void Run(const std::string& raw) {
         ESP_LOGI(TAG, "[CAM] BEGIN %u", (unsigned)jpeg.size());
         PrintBase64(jpeg);
         ESP_LOGI(TAG, "[CAM] END");
+        return;
+    }
+    if (cmd == "qface") {
+        // 立刻抓一帧摄像头刷脸（阻塞约 2 秒）。
+        // 为什么要单独开这个命令：正常刷脸走的是云端 MCP 工具
+        // self.qibao.face（action=verify），而设备还没在小智云端激活，
+        // 云端那条路走不通。这个命令不依赖云端，插上串口就能测刷脸。
+        qibao::Identity who = qibao::VerifyFace(true);
+        const char* name = (who == qibao::Identity::Owner) ? "岗哥" : "陌生人";
+        ESP_LOGI(TAG, "[CMD] < 刷脸结果=%s 相似度=%.3f 已解锁=%s", name,
+                 qibao::LastSimilarity(), qibao::IsUnlocked() ? "是" : "否");
         return;
     }
 #endif

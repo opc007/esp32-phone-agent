@@ -325,12 +325,25 @@ bash prebuilt/qibao_s31/flash.sh /dev/cu.usbserial-2110 460800
 - **WiFi 已连上 jjhome**，拿到 IP `10.197.1.66`（凭据已在 NVS，重启自动连）。
 - **TF 卡正常**：`TF 卡挂载成功：USD00（400 kHz, 4-bit）` + `读写自检：通过`。
 
-### 摄像头：驱动已修好，传感器仍不应答（进行中）
+### 摄像头：已彻底打通（SC101IOT，不是 OV3660）
 
-`qcam` 抓帧仍报 `EspVideo: open /dev/video2 failed, errno=2(No such file or directory)` ——
-**DVP 视频设备节点没生成**。已经修掉两层根因，第三层还在查。
+**最终结论：这块板子上装的摄像头模组是 SC101IOT（SCCB 地址 0x68、PID 0xda4a），不是盒子上印的 OV3660（0x3c）。**
+两件事同时成立才导致一开始「怎么都认不出来」。
 
-**第 1 层（已修）：驱动没编进固件。**
+这不是我们代码的锅 —— 乐鑫自己在上游记了同一个现象：
+
+- `espressif/esp-bsp#840`「ESP32-S31-Korvo-1: OV3660 camera XCLK (GPIO55) not toggling, sensor detect fails on chip rev v0.0」
+  —— 环境和我们完全一样（S31 rev v0.0 + IDF v6.1 + 官方未改示例）。
+  报告者用示波器量过：GPIO55 上**根本没有方波**。
+- 乐鑫协作者 espzav 在该 issue 里回复：
+  > You may have another camera sensor. It seems that some boxes has another camera sensor and not mentioned on the box print.
+
+  然后给了修复 PR `espressif/esp-bsp#831`「Fix the ESP32-S31-Korvo-1 BSP with the new camera」，
+  给 BSP 补上了 SC101IOT 支持。
+
+#### 修法的三层
+
+**第 1 层：驱动没编进固件。**
 板级 `config.json` 里写了 `"sdkconfig_append": ["CONFIG_CAMERA_OV3660=y"]`，
 但本工程是用 `sdkconfig.defaults;sdkconfig.defaults.esp32s31` 两个 defaults 文件生成 sdkconfig 的，
 `config.json` 的 `sdkconfig_append` **不在这条路径上生效**，
@@ -345,41 +358,65 @@ CONFIG_CAMERA_OV3660_DVP_DEFAULT_FMT_JPEG_320X240_25FPS=y
 CONFIG_XIAOZHI_CAMERA_ALLOW_JPEG_INPUT=y
 ```
 
-（最后一条：`EspVideo::Capture()` 只在开了这个时才走 JPEG 分支，而人脸识别那侧要的就是 JPEG 数据。
-输出选 320x240 JPEG 是因为识别侧正好按 320x240 解码，不用再缩放。）
-改完驱动确实编进去了（固件 +6.5KB flash），日志也从「完全没有 ov3660 字样」变成会打印 ov3660 的错误。
+**第 2 层：OV3660 那颗芯片根本不在板上（真正的根因）。**
+OV3660 的驱动编进去了，但传感器不应答 —— 因为板上根本没这颗芯片。
+把 SC101IOT 也编进去，两个驱动并存，esp_video 会在 DVP 端口上按注册顺序**逐个尝试**
+（`esp_video_init.c` 里 `esp_cam_sensor_detect_get_array()` 拿到全部 detect 函数后遍历），
+先试 OV3660(0x3c) 不应答，再试 SC101IOT(0x68) 应答 —— 不用事先知道装的是哪颗：
 
-**第 2 层（已修）：传感器探测前 XCLK 没输出。**
-OV3660 没有主时钟就不应答 SCCB。esp_video 的**公开** API `esp_video_init()` 没有时钟钩子
-（`esp_video_init_config_t` 里根本没有 `init_clk_func` 字段），
-XCLK 是 DVP 控制器起来之后才有的，而传感器探测发生在控制器**之前**；
-esp_video 内部其实有 `init_dvp_clk_func` 这个钩子，但它只接在 board-manager 那条路径上，
-板级直接调公开 API 用不到。
-修法：板级 `InitializeCamera()` 里、`new EspVideo(video_config)` **之前**手动拉起时钟：
-
-```cpp
-esp_cam_ctlr_dvp_start_clock(0, CAMERA_PIN_XCLK, CAM_CLK_SRC_DEFAULT, CAMERA_XCLK_FREQ_HZ);
+```
+CONFIG_CAMERA_SC101IOT=y
+CONFIG_CAMERA_SC101IOT_AUTO_DETECT_DVP_INTERFACE_SENSOR=y
+CONFIG_CAMERA_SC101IOT_DVP_YUV422_640X480_15FPS=y
+CONFIG_CAMERA_SC101IOT_DVP_YUV422_1280X720_15FPS=n
+CONFIG_CAMERA_SC101IOT_DVP_DEFAULT_FMT_YUV422_640X480_15FPS=y
+CONFIG_CAMERA_SC101IOT_POWER_ON_DELAY_US=20000
 ```
 
-头文件是 `#include <esp_private/esp_cam_dvp.h>`（IDF v6.1 的
-`components/esp_driver_cam/dvp/include/esp_private/esp_cam_dvp.h`）。
-现在启动日志能确认时钟起来了：`I DVP XCLK 已启动: GPIO55 @ 20000000 Hz`。
+改完启动日志就变成：
+```
+I sc101iot: Detected Camera sensor PID=0xda4a
+I EspVideo: Camera init success
+```
 
-**第 3 层（未解决）：传感器在 SCCB 上不应答。**
-日志停在：`E ov3660: Get sensor ID failed` / `E esp_video_init: Failed to detect camera sensor with address=3c`。
-即 XCLK 正常了，但 OV3660 的 SCCB（地址 0x3c）读 PID 没回 ACK。当前代码里 SCCB 是
-**复用 codec 的 I2C 总线**（`codec_i2c_bus_`，SDA=GPIO0 / SCL=GPIO1，10kHz），
-同一总线上还挂着 ES8389 和 GT1151 触摸。
+**第 3 层：SC101IOT 输出的是 YUV422(UYVY)，不是 JPEG。**
+原来那条「Capture() 拿到 JPEG → `jpeg_to_image_fit()` 解码」的路子直接废了。
+`EspVideo::Capture()` 是支持 `V4L2_PIX_FMT_UYVY` 的（会把原始帧拷出来），
+所以在 `qibao_persona.cc` 里加了一条 UYVY → RGB565 的转换：
 
-下一步候选（按性价比）：
-1. 官方 esp-bsp 给 esp32-s31-korvo-1 的摄像头 SCCB 用的是不是 GPIO0/GPIO1（可能是专用引脚）；
-   参考可跑通工程 `gitee.com/stonetan/esp32-s31-cam`（日志有 `Detected Camera sensor PID=0x3660`）。
-2. 官方 BSP 同时开了 `CONFIG_CAMERA_SC101IOT`（SCCB 地址 0x68，与 OV3660 的 0x3c 不同）—— 板上模组可能是它。
-3. XCLK 拉起后加 50~100ms 延时再探测（传感器上电稳定时间）。
-4. 换独立 I2C 控制器跑 SCCB（不与 codec/触摸共用），或把 SCCB 频率提到 100kHz。
+- `yuv_to_rgb565()`：BT.601 全范围整数近似，输出 `val=(R<<11)|(G<<5)|B` **小端**存放。
+  这个字节序必须和 `jpeg_to_image_fit()` 解出来的 RGB565LE 一致
+  （那个函数也是 `out_buf[2i]=低字节`），否则编码侧 `image_to_jpeg_cb(V4L2_PIX_FMT_RGB565)`
+  （走 `ESP_IMGFX_PIXEL_FMT_RGB565_LE`）会红蓝颠倒。
+- `uyvy_to_rgb565()`：UYVY 每 4 字节是 2 个像素（`U0 Y0 V0 Y1`，同对像素共用色度），
+  顺带最近邻缩到 320×240（识别侧的工作分辨率）。
+- `capture_rgb565()` 改成按实际帧格式分流：JPEG 走老路，UYVY 走新路，其它格式直接报错。
 
-在修好之前：**开机用照片认人是好的（走的是固件内置照片，不碰摄像头），
-但「站到镜头前刷脸开门」是不通的**。
+顺带照官方 BSP 补了 20ms 上电稳定延时（`esp-bsp` 的 `bsp_camera_start()` 就是
+「起 XCLK → `vTaskDelay(20ms)` → 探测」这个顺序）。
+
+#### 实测
+
+```
+I Qibao: Captured frame: 614400 bytes, 640x480, format=0x59565955   ('UYVY')
+I Qibao: UYVY -> RGB565 320x240
+I Qibao: Frame de-rotated 90° -> 240x320
+```
+
+- 0° 抓到 320×240 的正常房间画面，颜色正确（没有红蓝颠倒）。
+- 90° 抓到 240×320 的人脸特写，**脸是正立的**（跟着屏幕方向一起转了）。
+- 新增串口命令 `qface`：不依赖云端就能直接刷脸（设备还没在小智云端激活，
+  云端的 `self.qibao.face` 工具走不通），返回识别结果 + 相似度 + 是否解锁。
+
+#### 上游参考（要查就查这里）
+
+| 资料 | 地址 |
+|---|---|
+| 现象相同的 issue | https://github.com/espressif/esp-bsp/issues/840 |
+| 官方修复 PR | https://github.com/espressif/esp-bsp/pull/831 |
+| 官方 BSP 摄像头实现 | https://github.com/espressif/esp-bsp/blob/master/bsp/esp32_s31_korvo_1/src/bsp_camera.c |
+| 出厂 factory_demo（两个驱动都开） | https://github.com/espressif/esp-dev-kits/tree/master/examples/esp32-s31-korvo/examples/factory_demo |
+
 
 ### 顺带修掉的一个编译坑
 

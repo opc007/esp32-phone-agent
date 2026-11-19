@@ -92,10 +92,24 @@ def main():
         return 1
 
     # 阶段二：切方向
-    ser.write(f"qrot {args.dir}\r\n".encode())
-    ser.flush()
+    #
+    # 【为什么要重发】设备刚开机那几秒日志刷得极多（WiFi + MCP 握手），
+    # 串口控制台任务如果正卡在某个耗时操作（比如整套 UI 重建），
+    # UART 接收缓冲会被日志冲掉，命令就丢了 —— 表现是「脚本说没抓到，
+    # 但设备根本没收到这条命令」。
+    # 所以：发出去之后盯着设备的回显 "[CMD] > qrot <角度>"，
+    # 几秒内没看到就重发，最多 3 次。
+    sent = 0
+    last_send = 0.0
+    echoed = False
     t_end = time.time() + args.settle
     while time.time() < t_end:
+        now = time.time()
+        if not echoed and sent < 3 and now - last_send > 5.0:
+            ser.write(f"qrot {args.dir}\r\n".encode())
+            ser.flush()
+            sent += 1
+            last_send = now
         data = ser.read(4096)
         if not data:
             continue
@@ -104,6 +118,8 @@ def main():
         if args.verbose:
             sys.stdout.write(text)
             sys.stdout.flush()
+        if f"[CMD] > qrot {args.dir}" in text:
+            echoed = True
 
     # 阶段三：抓快照
     ser.write(b"qshot\r\n")

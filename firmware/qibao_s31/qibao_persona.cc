@@ -217,6 +217,62 @@ uint8_t* decode_jpeg_tight(const uint8_t* jpeg, size_t jpeg_len, int* out_w, int
     return tight;
 }
 
+// 单个像素的 YUV(UYVY) -> RGB565。
+// BT.601 全范围的整数近似（跟 JPEG 软解码里那套系数一致）：
+//   R = Y + 1.402*(V-128)
+//   G = Y - 0.344*(U-128) - 0.714*(V-128)
+//   B = Y + 1.772*(U-128)
+// 输出是 val = (R<<11)|(G<<5)|B 的**小端**存放 —— 这跟 jpeg_to_image_fit()
+// 解出来的 RGB565LE 布局完全一致（那个函数也是这样写 out_buf[2i]=低字节）。
+// 编码侧 image_to_jpeg_cb(V4L2_PIX_FMT_RGB565) 走的是 ESP_IMGFX_PIXEL_FMT_RGB565_LE，
+// 两边对得上，颜色不会红蓝颠倒。
+static inline uint16_t yuv_to_rgb565(int y, int u, int v) {
+    int r = (298 * y + 409 * v + 128) >> 8;
+    int g = (298 * y - 100 * u - 208 * v + 128) >> 8;
+    int b = (298 * y + 516 * u + 128) >> 8;
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+// UYVY(YUV422) 帧 -> RGB565，并顺便缩到 dst_w x dst_h（最近邻）。
+//
+// 【为什么需要这条路径】这块板子上装的摄像头**不是** OV3660，而是 SC101IOT
+// （实测 PID=0xda4a，SCCB 地址 0x68）。乐鑫在 esp-bsp issue #840 里确认过
+// 「有些盒子里的摄像头模组跟盒子上印的不一样」，官方随后在 PR #831 里
+// 给 ESP32-S31-Korvo-1 补上了 SC101IOT。
+// SC101IOT 只有 YUV422(UYVY) 输出、没有 JPEG，所以原来那条
+// 「Capture() 拿到 JPEG -> jpeg_to_image_fit 解码」的路径用不了。
+//
+// UYVY 字节排布：每 4 个字节是 2 个像素 —— U0 Y0 V0 Y1 | U1 Y1 V1 Y2 ...
+// 即同一对像素共用一组色度。
+// 返回新分配的缓冲（调用方释放），nullptr 表示失败。
+uint8_t* uyvy_to_rgb565(const uint8_t* src, int src_w, int src_h, int dst_w, int dst_h) {
+    if (src == nullptr || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) {
+        return nullptr;
+    }
+    uint8_t* out = (uint8_t*)heap_caps_malloc((size_t)dst_w * dst_h * 2,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (out == nullptr) {
+        return nullptr;
+    }
+    uint16_t* dst = (uint16_t*)out;
+    for (int y = 0; y < dst_h; ++y) {
+        int sy = y * src_h / dst_h;
+        const uint8_t* row = src + (size_t)sy * src_w * 2;
+        for (int x = 0; x < dst_w; ++x) {
+            int sx = x * src_w / dst_w;
+            int pair = sx & ~1;              // 同一对像素共用色度
+            int u = row[pair] - 128;
+            int v = row[pair + 2] - 128;
+            int yv = row[pair + 1 + (sx & 1)];
+            dst[y * dst_w + x] = yuv_to_rgb565(yv, u, v);
+        }
+    }
+    return out;
+}
+
 // 把一段 RGB565 图像顺时针转 angle 度（0/90/180/270），输出紧密排列的新缓冲。
 // 90/270 度时宽高互换（320x240 -> 240x320）。
 // 返回新分配的缓冲（调用方释放），nullptr 表示失败。
@@ -273,16 +329,34 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
         ESP_LOGE(TAG, "Camera capture failed");
         return nullptr;
     }
-    const uint8_t* jpeg = video->GetFrameData();
-    size_t jpeg_len = video->GetFrameSize();
-    if (jpeg == nullptr || jpeg_len == 0) {
+    const uint8_t* frame = video->GetFrameData();
+    size_t frame_len = video->GetFrameSize();
+    if (frame == nullptr || frame_len == 0) {
         ESP_LOGE(TAG, "No captured frame data");
         return nullptr;
     }
-    ESP_LOGI(TAG, "Captured JPEG: %u bytes, %ux%u", (unsigned)jpeg_len,
-             video->GetFrameWidth(), video->GetFrameHeight());
+    ESP_LOGI(TAG, "Captured frame: %u bytes, %ux%u, format=0x%x", (unsigned)frame_len,
+             video->GetFrameWidth(), video->GetFrameHeight(), (unsigned)video->GetFrameFormat());
 
-    uint8_t* rgb = decode_jpeg_tight(jpeg, jpeg_len, out_w, out_h);
+    // 按实际帧格式分流：
+    //   JPEG  -> 硬件/软件 JPEG 解码（OV3660 那条路）
+    //   UYVY  -> 自己转 RGB565（SC101IOT 这条路，这块板子上的实际传感器）
+    uint8_t* rgb = nullptr;
+    v4l2_pix_fmt_t fmt = video->GetFrameFormat();
+    if (fmt == V4L2_PIX_FMT_UYVY) {
+        rgb = uyvy_to_rgb565(frame, video->GetFrameWidth(), video->GetFrameHeight(),
+                             kWorkWidth, kWorkHeight);
+        if (rgb != nullptr) {
+            *out_w = kWorkWidth;
+            *out_h = kWorkHeight;
+            ESP_LOGI(TAG, "UYVY -> RGB565 %dx%d", kWorkWidth, kWorkHeight);
+        }
+    } else if (fmt == V4L2_PIX_FMT_JPEG) {
+        rgb = decode_jpeg_tight(frame, frame_len, out_w, out_h);
+    } else {
+        ESP_LOGE(TAG, "Unsupported camera frame format: 0x%x", (unsigned)fmt);
+        return nullptr;
+    }
     if (rgb == nullptr) {
         return nullptr;
     }

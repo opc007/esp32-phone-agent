@@ -19,7 +19,9 @@ import sys
 import time
 
 DEFAULT_PORT = "/dev/cu.usbserial-2110"
-SHOT_RE = re.compile(r"\[CAM\]\s+([A-Za-z0-9+/=]+)")
+# base64 数据行用的是 [SHOT] 前缀 —— 设备端的 PrintBase64() 是屏幕快照和
+# 摄像头抓帧共用的，它固定打 [SHOT]（不是 [CAM]）。所以这里必须匹配 [SHOT]。
+SHOT_RE = re.compile(r"\[SHOT\]\s+([A-Za-z0-9+/=]+)")
 READY_RE = re.compile(r"\[CMD\] < \{")
 
 
@@ -79,15 +81,34 @@ def main():
                 sys.stdout.write(text)
                 sys.stdout.flush()
 
-    ser.write(b"qcam\r\n")
-    ser.flush()
-    end = time.time() + 30.0
+    # 发 qcam。
+    # 【为什么要重发】设备刚开机那几秒日志刷得极多（WiFi + MCP 握手），
+    # 串口控制台任务如果正卡在某个耗时操作（比如切方向时整套 UI 重建），
+    # UART 接收缓冲会被日志冲掉，命令就丢了 —— 表现是「脚本说没抓到帧，
+    # 但设备根本没收到这条命令」。
+    # 所以：发出去之后盯着设备的回显 "[CMD] > qcam"，
+    # 几秒内没看到就重发，最多 3 次。
+    end = time.time() + args.timeout
+    sent = 0
+    last_send = 0.0
+    echoed = False
     while time.time() < end:
+        now = time.time()
+        if not echoed and sent < 3 and now - last_send > 6.0:
+            ser.write(b"qcam\r\n")
+            ser.flush()
+            sent += 1
+            last_send = now
         data = ser.read(4096)
         if not data:
             continue
         text = data.decode("utf-8", "ignore")
         buf.append(text)
+        if args.verbose:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        if "[CMD] > qcam" in text:
+            echoed = True
         if "[CAM] END" in text:
             break
 
