@@ -424,9 +424,33 @@ float* feature_from_jpeg(const unsigned char* jpg, size_t len, int feat_len) {
     return feat;
 }
 
+// 人脸模型只在真正要刷脸/录入时加载。
+// 开机就加载并跑两遍照片推理，会和已经起来的 LVGL/RGB 抢 flash cache，
+// Core 1 报 Cache error 然后整机重启，Wi-Fi 和小智语音都还没开始。
+bool EnsureModels() {
+    if (g_detector != nullptr && g_feature_model != nullptr) {
+        const int feat_len = g_feature_model->get_feat_len();
+        return feat_len > 0 && feat_len <= kMaxFeatureLength;
+    }
+    ESP_LOGI(TAG, "按需加载人脸模型（开机不加载，把内存和 cache 留给语音）");
+    g_detector = new HumanFaceDetect(HumanFaceDetect::MSRMNP_S8_V1, false);
+    g_feature_model = new HumanFaceFeat(HumanFaceFeat::MFN_S8_V1, false);
+    const int feat_len = g_feature_model->get_feat_len();
+    if (g_detector->get_raw_model(0) == nullptr ||
+        g_detector->get_raw_model(1) == nullptr ||
+        g_feature_model->get_raw_model() == nullptr ||
+        feat_len <= 0 || feat_len > kMaxFeatureLength) {
+        ESP_LOGE(TAG, "Face model init failed (feat_len=%d)", feat_len);
+        return false;
+    }
+    ESP_LOGI(TAG, "七宝人脸模块就绪，特征维度 %d，已录入=%d", feat_len,
+             g_owner_feature_len > 0 ? 1 : 0);
+    return true;
+}
+
 // 用岗哥照片自动录入 + 自检。返回是否在日志里验证了"同一人被认出"。
 bool EnrollFromReferenceAndSelfTest() {
-    if (g_feature_model == nullptr || g_detector == nullptr || !g_initialized) return false;
+    if (!g_initialized || !EnsureModels()) return false;
     const int feat_len = g_feature_model->get_feat_len();
 
     // 1) 用 enroll 帧录入
@@ -467,32 +491,19 @@ void Start() {
     if (g_initialized) return;
     g_mutex = xSemaphoreCreateMutex();
 
-    // 载入已录入的主人特征
+    // 只读已有特征，不在板级构造函数里跑检测模型。
+    // 实测：这里同步做「照片解码 + 两遍人脸推理」时，Core 1 会
+    // Guru Meditation (Cache error) 并重启，发生在 Wi-Fi / MQTT / 唤醒词加载之前。
+    // 特征已经在 TF 卡或 NVS 里，门禁基准不用每次开机重算。
     nvs_flash_init();  // 已初始化则无害
     LoadOwnerFeature();
-
-    // 初始化人脸模型（ESP32-S31 映射到 P4 模型资源）
-    g_detector = new HumanFaceDetect(HumanFaceDetect::MSRMNP_S8_V1, false);
-    g_feature_model = new HumanFaceFeat(HumanFaceFeat::MFN_S8_V1, false);
-    const int feat_len = g_feature_model->get_feat_len();
-    if (g_detector->get_raw_model(0) == nullptr ||
-        g_detector->get_raw_model(1) == nullptr ||
-        g_feature_model->get_raw_model() == nullptr ||
-        feat_len <= 0 || feat_len > kMaxFeatureLength) {
-        ESP_LOGE(TAG, "Face model init failed (feat_len=%d)", feat_len);
-        g_initialized = true;  // 标记避免重复初始化，功能降级
-        return;
-    }
     g_initialized = true;
-    ESP_LOGI(TAG, "七宝人脸模块就绪，特征维度 %d，已录入=%d", feat_len,
-             g_owner_feature_len > 0 ? 1 : 0);
-
-    // 只要还没用摄像头录过真人，开机就用岗哥照片重新录入并自检。
-    // 这样设备一上电就"认识"岗哥，不需要本人先站到镜头前录 3 张；
-    // 也会覆盖掉 TF 卡里可能残留的来路不明的特征，保证门禁基准一定来自本人照片。
-    // 一旦用户日后通过 action=enroll 用摄像头录入真人，置标记，之后开机不再覆盖。
-    if (!IsHumanEnrolled()) {
-        EnrollFromReferenceAndSelfTest();
+    if (g_owner_feature_len > 0) {
+        ESP_LOGI(TAG, "主人特征已载入（%d 维），开机跳过照片推理，先把小智语音拉起来",
+                 g_owner_feature_len);
+    } else {
+        ESP_LOGW(TAG, "还没有主人特征。开机不跑照片推理，避免 Cache error 打断连小智。"
+                      "需要时用串口 qface / relearn");
     }
 }
 
@@ -515,6 +526,10 @@ Identity VerifyFace(bool blocking) {
     (void)blocking;  // 当前实现为同步，保留参数兼容
     if (g_mutex == nullptr || !g_initialized) return Identity::Unknown;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if (!EnsureModels()) {
+        xSemaphoreGive(g_mutex);
+        return Identity::Unknown;
+    }
 
     Identity result = Identity::Unknown;
     g_last_similarity = -1.0F;
@@ -555,9 +570,13 @@ float LastSimilarity() {
 
 bool EnrollOwnerFace(uint8_t samples, bool blocking) {
     (void)blocking;
-    if (g_mutex == nullptr || !g_initialized || g_feature_model == nullptr) return false;
+    if (g_mutex == nullptr || !g_initialized) return false;
     if (samples == 0) samples = 3;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if (!EnsureModels()) {
+        xSemaphoreGive(g_mutex);
+        return false;
+    }
 
     const int feat_len = g_feature_model->get_feat_len();
     float* sum = (float*)heap_caps_calloc((size_t)feat_len, sizeof(float),
@@ -696,26 +715,6 @@ bool CaptureCameraJpeg(std::string& jpeg, int quality) {
     return ret;
 }
 
-// ---- 异步刷脸（唤醒时触发，不阻塞语音通道） ----
-static TaskHandle_t g_verify_task = nullptr;
-
-static void verify_task(void*) {
-    Identity who = VerifyFace(true);
-    if (who == Identity::Owner) {
-        ESP_LOGI(TAG, "刷脸通过：欢迎回来，%s！解锁 10 分钟", kOwnerName);
-    } else {
-        ESP_LOGI(TAG, "刷脸未通过（sim=%.3f）：%s", LastSimilarity(),
-                 GreetingFor(Identity::Unknown).c_str());
-    }
-    g_verify_task = nullptr;
-    vTaskDelete(nullptr);
-}
-
-static void trigger_async_verify() {
-    if (g_verify_task != nullptr) return;  // 已有刷脸任务在跑
-    xTaskCreate(verify_task, "qibao_verify", 8192, nullptr, 2, &g_verify_task);
-}
-
 void StartBridge() {
     Start();  // 初始化人脸 + 载入 NVS 特征
 
@@ -765,16 +764,19 @@ void StartBridge() {
 
 // ---- 给 application.cc 的 C 弱符号实现 ----
 extern "C" bool QibaoGateAllowed(const char* command) {
+    (void)command;
     // 没录入主人人脸 = 功能降级模式，放行（避免把自己锁在外面）
     if (!qibao::HasOwnerFace()) return true;
     // 已解锁（10 分钟内）直接放行
     if (qibao::IsUnlocked()) return true;
-    // 未解锁：拒绝，并异步刷脸，用户再说一次即可
-    qibao::trigger_async_verify();
-    ESP_LOGW(TAG, "[Qibao] 未解锁，拒绝控制指令，已触发异步刷脸");
+    // 未解锁只拒绝本机控制指令，不要在语音会话里启动摄像头+人脸模型。
+    // 那条推理和屏幕/音频抢 cache，会把正在进行的小智对话直接重启掉。
+    // 想解锁用串口 qface（空闲时刷一次）。
+    ESP_LOGW(TAG, "[Qibao] 未解锁，拒绝控制指令（不在对话中启动刷脸）");
     return false;
 }
 
 extern "C" void QibaoOnWake() {
-    qibao::trigger_async_verify();
+    // 唤醒瞬间不要刷脸。语音通道要先连上、先能对话。
+    ESP_LOGI(TAG, "唤醒：先进行语音对话，本次不跑刷脸");
 }

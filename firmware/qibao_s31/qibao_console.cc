@@ -121,7 +121,7 @@ void Run(const std::string& raw) {
     ESP_LOGI(TAG, "[CMD] > %s", raw.c_str());
 
     if (cmd == "help" || cmd == "?") {
-        ESP_LOGI(TAG, "[CMD] < help | state | qrotate(转 90°) | qrot <0|90|180|270> | "
+        ESP_LOGI(TAG, "[CMD] < help | state | qtalk(切换对话) | qrotate(转 90°) | qrot <0|90|180|270> | "
                       "qpose(换姿势) | qstatus | qprobe | qdiag | qshot | qcam | qface(刷脸) | "
                       "wifiset <ssid> <密码> | wifilist | macphone <整句> | macapps | macscreen");
         return;
@@ -129,6 +129,13 @@ void Run(const std::string& raw) {
     if (cmd == "state") {
         int s = (int)Application::GetInstance().GetDeviceState();
         ESP_LOGI(TAG, "[CMD] < 设备状态=%d (%s)", s, StateName(s));
+        return;
+    }
+    if (cmd == "qtalk") {
+        // 不依赖唤醒词，直接走小智原来的 BOOT/MODE 短按：idle ↔ listening。
+        Application::GetInstance().ToggleChatState();
+        int s = (int)Application::GetInstance().GetDeviceState();
+        ESP_LOGI(TAG, "[CMD] < 已切换对话，当前状态=%d (%s)", s, StateName(s));
         return;
     }
 #if MAC_CONTROL_ENABLE
