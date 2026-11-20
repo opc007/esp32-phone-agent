@@ -33,6 +33,7 @@
 #include "mac_control_tools.h"
 #include "qibao_display.h"
 #include "qibao_persona.h"
+#include "qibao_see.h"
 #include "qibao_screen.h"
 #endif
 #include "ssid_manager.h"
@@ -175,6 +176,23 @@ void Run(const std::string& raw) {
         }
         disp->SwitchPose();
         ESP_LOGI(TAG, "[CMD] < 已换成%s", disp->CurrentFrame() == 0 ? "站姿" : "坐姿");
+        return;
+    }
+    if (cmd == "qenroll") {
+        bool ok = qibao::EnrollOwnerFace(3, true);
+        ESP_LOGI(TAG, "[CMD] < %s",
+                 ok ? "岗哥登记成功，特征已写入 TF 卡"
+                    : "登记失败：画面里没有稳定的人脸。请正对摄像头再敲 qenroll");
+        return;
+    }
+    if (cmd == "qmodel") {
+        int expect = args.empty() ? 2989296 : atoi(args[0].c_str());
+        int got = qibao::ReceiveModel(expect);
+        ESP_LOGI(TAG, "[CMD] < 模型写入 %d 字节", got);
+        return;
+    }
+    if (cmd == "qobj") {
+        ESP_LOGI(TAG, "[CMD] < %s", qibao::SeeOnce().c_str());
         return;
     }
     if (cmd == "qview") {
@@ -326,5 +344,5 @@ void StartQibaoConsole() {
             }
             vTaskDelay(pdMS_TO_TICKS(80));
         }
-    }, "qibao_console", 4096, nullptr, 2, nullptr);
+    }, "qibao_console", 12288, nullptr, 2, nullptr);
 }

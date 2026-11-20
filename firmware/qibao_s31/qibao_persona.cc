@@ -31,6 +31,7 @@
 #include "mcp_server.h"
 #include "application.h"
 #include "qibao_display.h"
+#include "qibao_see.h"
 #include "dl_image_define.hpp"
 #include "human_face_detect.hpp"
 #include "human_face_recognition.hpp"
@@ -437,7 +438,14 @@ bool EnsureModels() {
         const int feat_len = g_feature_model->get_feat_len();
         return feat_len > 0 && feat_len <= kMaxFeatureLength;
     }
-    ESP_LOGI(TAG, "按需加载人脸模型（开机不加载，把内存和 cache 留给语音）");
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    // 摄像头打开后内部内存大约只剩 70KB，这时构造模型会 Load access fault。
+    // 内存还宽裕时再加载，张量走 PSRAM，加载后推理不再要这么多内部内存。
+    if (before < 120 * 1024) {
+        ESP_LOGW(TAG, "内部内存 %u，先不加载人脸模型", (unsigned)before);
+        return false;
+    }
+    ESP_LOGI(TAG, "按需加载人脸模型，加载前内部内存 %u", (unsigned)before);
     g_detector = new HumanFaceDetect(HumanFaceDetect::MSRMNP_S8_V1, false);
     g_feature_model = new HumanFaceFeat(HumanFaceFeat::MFN_S8_V1, false);
     const int feat_len = g_feature_model->get_feat_len();
@@ -448,8 +456,9 @@ bool EnsureModels() {
         ESP_LOGE(TAG, "Face model init failed (feat_len=%d)", feat_len);
         return false;
     }
-    ESP_LOGI(TAG, "七宝人脸模块就绪，特征维度 %d，已录入=%d", feat_len,
-             g_owner_feature_len > 0 ? 1 : 0);
+    ESP_LOGI(TAG, "七宝人脸模块就绪，特征维度 %d，已录入=%d，内部内存 %u -> %u", feat_len,
+             g_owner_feature_len > 0 ? 1 : 0, (unsigned)before,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     return true;
 }
 
@@ -503,6 +512,20 @@ void Start() {
     nvs_flash_init();  // 已初始化则无害
     LoadOwnerFeature();
     g_initialized = true;
+    xTaskCreate([](void*) {
+        for (int i = 0; i < 12; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 140 * 1024) {
+                EnsureModels();
+                // 不在这里预加载物品模型。实测内部内存还有 18 万时加载，
+                // 仍会把 SRAM 打到十几字节并重启。认物只留给 qobj / self.qibao.see。
+                vTaskDelete(nullptr);
+                return;
+            }
+        }
+        ESP_LOGW(TAG, "内部内存一直偏紧，人脸模型等内存松一点再加载");
+        vTaskDelete(nullptr);
+    }, "qibao_face_load", 16384, nullptr, 1, nullptr);
     if (g_owner_feature_len > 0) {
         ESP_LOGI(TAG, "主人特征已载入（%d 维），开机跳过照片推理，先把小智语音拉起来",
                  g_owner_feature_len);
@@ -846,11 +869,11 @@ void CameraTask(void*) {
         }
         const int64_t now = esp_timer_get_time();
         const auto talk = Application::GetInstance().GetDeviceState();
-        const bool talking = talk == kDeviceStateListening || talk == kDeviceStateSpeaking;
+        const bool speaking = talk == kDeviceStateSpeaking;
         const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        // 人脸模型一加载就会把内部内存打到只剩十几字节，MQTT 随即 ENOMEM 断开。
-        // 内存不宽裕、或正在对话时，不加载、不推理。
-        if (!talking && internal_free > 120 * 1024 && g_watch.frame != nullptr &&
+        // 正在播语音时不跑网络。内部内存低于 20KB 也不跑，免得把 MQTT 挤断。
+        // 张量优先放 PSRAM（模型构造时限制了内部内存），所以不再要求 120KB。
+        if (!speaking && internal_free > 20 * 1024 && g_watch.frame != nullptr &&
             now - g_watch.last_recog_us > 2000000) {
             g_watch.last_recog_us = now;
             uint8_t* copy = nullptr;
@@ -867,7 +890,6 @@ void CameraTask(void*) {
             }
             xSemaphoreGive(g_watch.mu);
             if (copy != nullptr) {
-                // 人脸网络不在 LVGL 线程跑，并且大约 1.5 秒才一次。
                 const SeenFace seen = ClassifyFrame(copy, cw, ch);
                 heap_caps_free(copy);
                 ObserveFace(seen);
@@ -938,11 +960,28 @@ bool CopyLatestFrame(uint8_t* dst, int dst_w, int dst_h) {
 
 const char* ViewerBadge() {
     if (!g_watch.on) return "";
-    return BadgeFor(g_watch.shown);
+    const char* face = BadgeFor(g_watch.shown);
+    if (face[0] != '\0') return face;
+    const char* thing = ObjectBadge();
+    return thing != nullptr ? thing : "";
 }
 
 std::string ViewerInstruction() {
-    return InstructionFor(g_watch.on ? g_watch.shown : SeenFace::None, g_watch.on);
+    std::string text = InstructionFor(g_watch.on ? g_watch.shown : SeenFace::None, g_watch.on);
+    std::string things = LastObjects();
+    if (!things.empty()) {
+        text += " 画面里还看到：";
+        text += things;
+        text += "。可以用中文把这些物品告诉用户，不要把这句话原文念出来。";
+    }
+    return text;
+}
+
+uint8_t* GrabRgb565(int* w, int* h) {
+    if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+    uint8_t* rgb = capture_rgb565(w, h, true);
+    if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+    return rgb;
 }
 
 void ShowLivePreview(bool on) {
@@ -1039,6 +1078,17 @@ void StartBridge() {
                                    : std::string("实时画面没打开，预览任务没有起来");
         });
     ESP_LOGI(TAG, "实时摄像头工具已注册：self.qibao.camera");
+
+    mcp.AddTool(
+        "self.qibao.see",
+        "看画面里有哪些人和物品。用户问「你看到什么」「这是什么」「认一下」时调用。\n"
+        "返回岗哥/访客，以及 COCO 物品的中文名。不要把返回原文整段念出来，用自己的话讲。\n"
+        "这不是门锁。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            return ViewerInstruction();
+        });
+    ESP_LOGI(TAG, "认人认物工具已注册：self.qibao.see");
 }
 
 }  // namespace qibao

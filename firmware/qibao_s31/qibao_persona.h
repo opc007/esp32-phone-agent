@@ -69,6 +69,9 @@ std::string StatusJson();
 // 调试用：切到竖屏后抓一张看看人脸是不是正的。
 bool CaptureCameraJpeg(std::string& jpeg, int quality = 75);
 
+// 抓一帧已按屏幕方向转正的 RGB565。调用方用 heap_caps_free 释放。
+uint8_t* GrabRgb565(int* w, int* h);
+
 // ---- 视频小窗（只有用户点开摄像头才跑，开机/唤醒不自动开）----
 void SetCameraWatch(bool on);
 void ShowLivePreview(bool on);
