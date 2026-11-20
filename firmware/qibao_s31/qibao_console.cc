@@ -192,7 +192,7 @@ void Run(const std::string& raw) {
         return;
     }
     if (cmd == "qobj") {
-        ESP_LOGI(TAG, "[CMD] < %s", qibao::SeeOnce().c_str());
+        ESP_LOGI(TAG, "[CMD] < %s", qibao::DescribeScene().c_str());
         return;
     }
     if (cmd == "qview") {

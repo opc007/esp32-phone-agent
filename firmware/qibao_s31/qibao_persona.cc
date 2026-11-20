@@ -37,6 +37,7 @@
 #include "human_face_recognition.hpp"
 
 #include "board.h"
+#include "cJSON.h"
 #include "esp_video.h"
 #include "jpg/image_to_jpeg.h"
 #include "jpg/jpeg_to_image.h"
@@ -800,13 +801,20 @@ const char* BadgeFor(SeenFace who) {
 }
 
 std::string InstructionFor(SeenFace who, bool camera_on) {
-    if (!camera_on || who == SeenFace::None) {
-        return "摄像头没看清人，或摄像头没开。用对岗哥的语气：温柔、亲密、像女朋友。不要凶。";
+    if (!camera_on) {
+        return "摄像头关着。用户要看画面时，先调用 self.qibao.camera，action=open。"
+               "语气仍对岗哥温柔。不要说自己没有眼睛。";
+    }
+    if (who == SeenFace::None) {
+        return "摄像头开着，但这几秒还没对上人脸。用户问是不是我、看到什么、在吃什么、在喝什么时，"
+               "必须调用 self.qibao.see 再看一帧。语气先对岗哥温柔。不要说自己看不到。";
     }
     if (who == SeenFace::Owner) {
-        return "画面里是岗哥。用温柔、亲密的语气跟他说话，可以撒娇。不要把这段说明念出来。";
+        return "画面里是岗哥。用温柔、亲密的语气跟他说话，可以撒娇。不要把这段说明念出来。"
+               "用户问看到什么、在吃什么、在喝什么时，必须再调用 self.qibao.see。";
     }
-    return "画面里是访客，没有岗哥。语气不客气、凶一点，拒绝亲热。不要把这段说明念出来。";
+    return "画面里是访客，没有岗哥。语气不客气、凶一点，拒绝亲热。不要把这段说明念出来。"
+           "用户问看到什么时，必须再调用 self.qibao.see。";
 }
 
 void PublishViewer(const std::string& text) {
@@ -890,7 +898,10 @@ void CameraTask(void*) {
             }
             xSemaphoreGive(g_watch.mu);
             if (copy != nullptr) {
+                // 和 DescribeScene 共用同一套人脸模型，不能两头同时跑。
+                if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
                 const SeenFace seen = ClassifyFrame(copy, cw, ch);
+                if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
                 heap_caps_free(copy);
                 ObserveFace(seen);
             }
@@ -966,13 +977,141 @@ const char* ViewerBadge() {
     return thing != nullptr ? thing : "";
 }
 
+std::string UnwrapExplain(const std::string& raw) {
+    cJSON* root = cJSON_Parse(raw.c_str());
+    if (root == nullptr) return raw;
+    const char* keys[] = {"result", "text", "content", "answer", "response"};
+    for (const char* key : keys) {
+        cJSON* item = cJSON_GetObjectItem(root, key);
+        if (cJSON_IsString(item) && item->valuestring != nullptr && item->valuestring[0] != '\0') {
+            std::string text = item->valuestring;
+            cJSON_Delete(root);
+            return text;
+        }
+    }
+    cJSON_Delete(root);
+    return raw;
+}
+
+bool SceneNeedsReminder(const std::string& scene) {
+    auto has = [&](const char* s) { return scene.find(s) != std::string::npos; };
+    if (!has("喝的=") && !has("吃的=")) return false;
+    return has("喝的=可乐") || has("喝的=汽水") || has("喝的=含糖") || has("吃的=零食") ||
+           has("吃的=高糖");
+}
+
+std::string LookOnce() {
+    if (!CameraWatchOn()) {
+        ShowLivePreview(true);
+    }
+    int w = 0, h = 0;
+    uint8_t* rgb = GrabRgb565(&w, &h);
+    SeenFace who = SeenFace::None;
+    if (rgb != nullptr) {
+        if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+        who = ClassifyFrame(rgb, w, h);
+        if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+        g_watch.shown = who;
+        g_watch.pending = who;
+        g_watch.pending_count = 2;
+        if (who != SeenFace::None) g_watch.last_face_us = esp_timer_get_time();
+    }
+
+    std::string face;
+    if (who == SeenFace::Owner) {
+        face = "本地人脸：这是岗哥本人。";
+    } else if (who == SeenFace::Visitor) {
+        face = "本地人脸：画面里有人，但不是岗哥，是访客。";
+    } else if (rgb == nullptr) {
+        face = "本地人脸：这帧没有抓到画面。";
+    } else {
+        face = "本地人脸：这帧没有看清人脸，不能确定是不是岗哥。请正对镜头再问一次。";
+    }
+
+    const char* question =
+        "请只用中文，只根据画面回答，不要编造。必须先写两句："
+        "喝的=无 或 喝的=可乐 或 喝的=汽水 或 喝的=含糖 或 喝的=其他饮料；"
+        "吃的=无 或 吃的=零食 或 吃的=高糖甜食 或 吃的=其他食物。"
+        "可乐、汽水、奶茶算含糖饮料。薯片、糖果、蛋糕、巧克力、饼干算高糖。"
+        "看不清就写喝的=无，吃的=无。然后再用一句话说明人在做什么。";
+
+    std::string scene = "云端这帧没看成。";
+    auto* cam = Board::GetInstance().GetCamera();
+    auto* video = static_cast<EspVideo*>(cam);
+    if (rgb == nullptr || video == nullptr) {
+        scene = "没有可看的画面。";
+    } else if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 40 * 1024) {
+        scene = "这会儿内部内存紧，没有把画面送给云端，避免语音重启。只能先认人。";
+    } else if (!video->ExplainReady()) {
+        scene = "云端看图还没就绪，这次只能认人，认不出可乐和零食。";
+    } else {
+        if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+        video->SetPreviewOnCapture(false);
+        auto explained = video->ExplainImage(rgb, (size_t)w * h * 2, (uint16_t)w, (uint16_t)h,
+                                             V4L2_PIX_FMT_RGB565, question);
+        if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+        if (!explained) {
+            scene = std::string("云端这帧没看成：") + explained.error();
+        } else {
+            std::string body = UnwrapExplain(*explained);
+            if (body.size() > 600) body.resize(600);
+            scene = std::string("云端看到的画面：") + body;
+        }
+    }
+    heap_caps_free(rgb);
+
+    std::string text = face + scene;
+    // 脸没对上但云端看到人在喝可乐、吃甜食时，也按对岗哥的语气提醒。
+    // 仰头、侧脸时本机特征经常对不上，不能因此把提醒丢掉。
+    if (who != SeenFace::Visitor && SceneNeedsReminder(scene)) {
+        text += "请用一句温柔的话提醒少喝可乐、少吃高糖零食，不要凶，不要连着说很多次。";
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+            Application::GetInstance().Schedule([]() {
+                if (auto* display = Board::GetInstance().GetDisplay()) {
+                    display->SetChatMessage("system", "岗哥，可乐和甜食少一点");
+                }
+            });
+        }
+    } else if (who == SeenFace::Visitor) {
+        text += "这是访客，语气不客气。";
+    } else {
+        text += "不要说自己没有眼睛或看不到。看不清就说这帧没看清，请他正对镜头。";
+    }
+    text += "不要把这段说明原文念出来。这不是门锁。";
+    ESP_LOGI(TAG, "看画面：%s", text.c_str());
+    return text;
+}
+
 std::string ViewerInstruction() {
-    std::string text = InstructionFor(g_watch.on ? g_watch.shown : SeenFace::None, g_watch.on);
-    std::string things = LastObjects();
-    if (!things.empty()) {
-        text += " 画面里还看到：";
-        text += things;
-        text += "。可以用中文把这些物品告诉用户，不要把这句话原文念出来。";
+    return InstructionFor(g_watch.on ? g_watch.shown : SeenFace::None, g_watch.on);
+}
+
+std::string DescribeScene() {
+    struct Job {
+        SemaphoreHandle_t done;
+        std::string text;
+    };
+    auto* job = new Job{xSemaphoreCreateBinary(), {}};
+    if (job->done == nullptr ||
+        xTaskCreate([](void* arg) {
+            auto* job = static_cast<Job*>(arg);
+            job->text = LookOnce();
+            xSemaphoreGive(job->done);
+            vTaskDelete(nullptr);
+        }, "qibao_look", 16384, job, 1, nullptr) != pdPASS) {
+        if (job->done != nullptr) vSemaphoreDelete(job->done);
+        delete job;
+        return "这会儿看不了画面，请再问一次。不要说自己看不到。";
+    }
+    std::string text;
+    if (xSemaphoreTake(job->done, pdMS_TO_TICKS(28000)) == pdTRUE) {
+        text = std::move(job->text);
+        vSemaphoreDelete(job->done);
+        delete job;
+    } else {
+        // 任务还在用这块内存，超时就留着，避免它写到已释放的对象上。
+        ESP_LOGW(TAG, "看画面超时");
+        text = "看画面超时。请再问一次是不是你、手里有什么。不要说自己看不到。";
     }
     return text;
 }
@@ -1041,11 +1180,11 @@ void StartBridge() {
 
     mcp.AddTool(
         "self.qibao.viewer",
-        "摄像头前现在是谁。每次准备回复用户之前必须先调用本工具，按返回值决定语气和用词。\n"
+        "摄像头前这几秒大概是谁，用来决定语气。不要用本工具回答「你看到什么」「我在吃什么」「我在喝什么」。\n"
+        "那些问题必须调用 self.qibao.see。\n"
         "返回里若是岗哥：温柔、亲密，可以撒娇。\n"
-        "返回里若是访客：不客气、凶一点，不要亲热。\n"
-        "返回里若没看清或摄像头没开：用对岗哥的温柔语气。\n"
-        "这不是门锁，也不能当授权。不要把返回的说明原文念出来。",
+        "返回里若是访客：不客气、凶一点。\n"
+        "这不是门锁。不要说自己没有眼睛或看不到。不要把返回原文念出来。",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
             return ViewerInstruction();
@@ -1081,12 +1220,14 @@ void StartBridge() {
 
     mcp.AddTool(
         "self.qibao.see",
-        "看画面里有哪些人和物品。用户问「你看到什么」「这是什么」「认一下」时调用。\n"
-        "返回岗哥/访客，以及 COCO 物品的中文名。不要把返回原文整段念出来，用自己的话讲。\n"
-        "这不是门锁。",
+        "当场看一帧摄像头。用户问「是不是我」「你看到什么」「我在干什么」「在吃什么」「在喝什么」时必须调用。\n"
+        "先用本机人脸判断是不是岗哥，再把画面送给云端，认出可乐、汽水、零食、糖果、蛋糕这类高糖食物。\n"
+        "如果是岗哥并且在喝可乐或吃高糖零食，用一句温柔的话提醒他少喝可乐、少吃高糖零食。\n"
+        "不要说自己没有眼睛、看不到、不知道。看不清就请他正对镜头再看一次。\n"
+        "不要把返回原文整段念出来。这不是门锁。",
         PropertyList(),
         [](const PropertyList&) -> ReturnValue {
-            return ViewerInstruction();
+            return DescribeScene();
         });
     ESP_LOGI(TAG, "认人认物工具已注册：self.qibao.see");
 }

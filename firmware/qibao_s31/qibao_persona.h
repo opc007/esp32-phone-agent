@@ -87,6 +87,10 @@ const char* ViewerBadge();
 // 给小智模型的语气说明。不是用户说的话，不要当 STT 念出来。
 std::string ViewerInstruction();
 
+// 当场看一帧。本地人脸判断是不是岗哥，并把转正后的画面送给云端，
+// 认出喝可乐、吃高糖零食。不加载 TF 卡上那份大物品模型。
+std::string DescribeScene();
+
 // ---- 与固件主程序的桥接 ----
 // 实现 application.cc 的门禁弱符号、注册 self.qibao MCP 工具。
 // 在板级构造函数里和 Start() 一起调用。
