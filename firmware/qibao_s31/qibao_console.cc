@@ -33,6 +33,7 @@
 #include "mac_control_tools.h"
 #include "qibao_display.h"
 #include "qibao_persona.h"
+#include "qibao_see.h"
 #include "qibao_screen.h"
 #endif
 #include "ssid_manager.h"
@@ -121,7 +122,7 @@ void Run(const std::string& raw) {
     ESP_LOGI(TAG, "[CMD] > %s", raw.c_str());
 
     if (cmd == "help" || cmd == "?") {
-        ESP_LOGI(TAG, "[CMD] < help | state | qrotate(转 90°) | qrot <0|90|180|270> | "
+        ESP_LOGI(TAG, "[CMD] < help | state | qtalk(切换对话) | qrotate(转 90°) | qrot <0|90|180|270> | "
                       "qpose(换姿势) | qstatus | qprobe | qdiag | qshot | qcam | qface(刷脸) | "
                       "wifiset <ssid> <密码> | wifilist | macphone <整句> | macapps | macscreen");
         return;
@@ -129,6 +130,13 @@ void Run(const std::string& raw) {
     if (cmd == "state") {
         int s = (int)Application::GetInstance().GetDeviceState();
         ESP_LOGI(TAG, "[CMD] < 设备状态=%d (%s)", s, StateName(s));
+        return;
+    }
+    if (cmd == "qtalk") {
+        // 不依赖唤醒词，直接走小智原来的 BOOT/MODE 短按：idle ↔ listening。
+        Application::GetInstance().ToggleChatState();
+        int s = (int)Application::GetInstance().GetDeviceState();
+        ESP_LOGI(TAG, "[CMD] < 已切换对话，当前状态=%d (%s)", s, StateName(s));
         return;
     }
 #if MAC_CONTROL_ENABLE
@@ -168,6 +176,51 @@ void Run(const std::string& raw) {
         }
         disp->SwitchPose();
         ESP_LOGI(TAG, "[CMD] < 已换成%s", disp->CurrentFrame() == 0 ? "站姿" : "坐姿");
+        return;
+    }
+    if (cmd == "qenroll") {
+        bool ok = qibao::EnrollOwnerFace(3, true);
+        ESP_LOGI(TAG, "[CMD] < %s",
+                 ok ? "岗哥登记成功，特征已写入 TF 卡"
+                    : "登记失败：画面里没有稳定的人脸。请正对摄像头再敲 qenroll");
+        return;
+    }
+    if (cmd == "qmodel") {
+        int expect = args.empty() ? 2989296 : atoi(args[0].c_str());
+        int got = qibao::ReceiveModel(expect);
+        ESP_LOGI(TAG, "[CMD] < 模型写入 %d 字节", got);
+        return;
+    }
+    if (cmd == "qobj") {
+        ESP_LOGI(TAG, "[CMD] < %s", qibao::DescribeScene().c_str());
+        return;
+    }
+    if (cmd == "qview") {
+        const bool on = !qibao::CameraWatchOn();
+        qibao::ShowLivePreview(on);
+        ESP_LOGI(TAG, "[CMD] < 实时小窗 %s", on ? "开" : "关");
+        return;
+    }
+    if (cmd == "qhit") {
+        auto* disp = QibaoLcdDisplay::Instance();
+        if (disp == nullptr) {
+            ESP_LOGI(TAG, "[CMD] < 显示还没初始化");
+            return;
+        }
+        disp->LogHitBoxes();
+        return;
+    }
+    if (cmd == "qtap") {
+        if (args.size() < 2) {
+            ESP_LOGI(TAG, "[CMD] < 用法: qtap <x> <y>");
+            return;
+        }
+        auto* disp = QibaoLcdDisplay::Instance();
+        if (disp == nullptr) {
+            ESP_LOGI(TAG, "[CMD] < 显示还没初始化");
+            return;
+        }
+        disp->HandlePhysicalTap(atoi(args[0].c_str()), atoi(args[1].c_str()));
         return;
     }
     if (cmd == "qstatus") {
@@ -291,5 +344,5 @@ void StartQibaoConsole() {
             }
             vTaskDelay(pdMS_TO_TICKS(80));
         }
-    }, "qibao_console", 4096, nullptr, 2, nullptr);
+    }, "qibao_console", 12288, nullptr, 2, nullptr);
 }

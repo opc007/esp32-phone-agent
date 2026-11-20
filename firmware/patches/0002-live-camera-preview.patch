@@ -1,0 +1,106 @@
+diff --git a/main/boards/common/esp_video.cc b/main/boards/common/esp_video.cc
+index 09cf706..c872572 100644
+--- a/main/boards/common/esp_video.cc
++++ b/main/boards/common/esp_video.cc
+@@ -773,6 +773,12 @@ bool EspVideo::Capture() {
+         }
+     }
+ 
++    // 实时小窗自己画。这里再做一张半屏静帧会把 UYVY 转成另一块大图，
++    // 失败时还会让本来已经抓到的帧变成 Capture() 失败。
++    if (!preview_on_capture_) {
++        return frame_.data != nullptr;
++    }
++
+     // 显示预览图片
+     auto display = Board::GetInstance().GetDisplay();
+     if (display != nullptr) {
+@@ -453,5 +453,5 @@ bool EspVideo::Capture() {
+ #else
+-            ESP_LOGW(TAG,
++            ESP_LOGD(TAG,
+                      "mmap_buffers_[buf.index].length = %d, frame.width = %d, frame.height = %d",
+                      mmap_buffers_[buf.index].length, frame_.width, frame_.height);
+ #endif  // CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
+diff --git a/main/boards/common/esp_video.h b/main/boards/common/esp_video.h
+--- a/main/boards/common/esp_video.h
++++ b/main/boards/common/esp_video.h
+@@ -42,6 +42,9 @@ private:
+     std::string explain_url_;
+     std::string explain_token_;
+     std::thread encoder_thread_;
++    // 七宝自己画右上角实时小窗时关掉这里的半屏静帧。
++    // 那张静帧会占一块大缓冲，失败时整次 Capture 也变成失败，小窗就一直是黑的。
++    bool preview_on_capture_ = false;
+ 
+ public:
+     EspVideo(const esp_video_init_config_t& config);
+@@ -51,6 +54,7 @@ public:
+     virtual void SetExplainUrl(const std::string& url, const std::string& token);
+     virtual bool Capture();
++    void SetPreviewOnCapture(bool enabled) { preview_on_capture_ = enabled; }
+     // 获取 Capture() 抓取的帧（供本地人脸识別等模块用）。
+     // 返回的指针归本对象所有，调用方不得释放；下次 Capture() 后失效。
+     const uint8_t* GetFrameData() const { return frame_.data; }
+diff --git a/main/mcp_server.cc b/main/mcp_server.cc
+index 555b6d9..603b5ad 100644
+--- a/main/mcp_server.cc
++++ b/main/mcp_server.cc
+@@ -91,28 +91,35 @@ void McpServer::AddCommonTools() {
+ 
+     auto camera = board.GetCamera();
+     if (camera) {
+-        AddTool("self.camera.take_photo",
+-                "Always remember you have a camera. If the user asks you to see something, use "
+-                "this tool to take a photo and then explain it.\n"
+-                "Args:\n"
+-                "  `question`: The question that you want to ask about the photo.\n"
+-                "Return:\n"
+-                "  A JSON object that provides the photo information.",
+-                PropertyList({Property("question", kPropertyTypeString)}),
+-                [camera](const PropertyList& properties) -> ToolResult {
+-                    // Lower the priority to do the camera capture
+-                    TaskPriorityReset priority_reset(1);
+-
+-                    if (!camera->Capture()) {
+-                        return std::unexpected("Failed to capture photo");
+-                    }
+-                    auto question = properties["question"].value<std::string>();
+-                    auto result = camera->Explain(question);
+-                    if (!result) {
+-                        return std::unexpected(std::move(result.error()));
+-                    }
+-                    return std::move(*result);
+-                });
++        AddTool(
++            "self.camera.take_photo",
++            "Take one photo and explain it. Do not use this tool when the user asks to open or "
++            "close the camera, start a video call, or show the live preview. For that, call "
++            "self.qibao.camera with action=open or action=close.\n"
++            "Args:\n"
++            "  `question`: The question that you want to ask about the photo.\n"
++            "Return:\n"
++            "  A JSON object that provides the photo information.",
++            PropertyList({Property("question", kPropertyTypeString)}),
++            [camera](const PropertyList& properties) -> ToolResult {
++                // Lower the priority to do the camera capture
++                TaskPriorityReset priority_reset(1);
++                // 定义在 qibao_persona.cc。没有七宝界面时是空函数。
++                extern void QibaoOnPhotoTool();
++
++                if (!camera->Capture()) {
++                    QibaoOnPhotoTool();
++                    return std::unexpected("Failed to capture photo");
++                }
++                auto question = properties["question"].value<std::string>();
++                auto result = camera->Explain(question);
++                // 讲解用完这一帧之后再开实时小窗，避免两路同时改同一帧缓冲。
++                QibaoOnPhotoTool();
++                if (!result) {
++                    return std::unexpected(std::move(result.error()));
++                }
++                return std::move(*result);
++            });
+     }
+ #endif
+ 

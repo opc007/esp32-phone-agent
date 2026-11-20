@@ -45,9 +45,8 @@ CONFIG_USE_CUSTOM_WAKE_WORD=y
 CONFIG_CUSTOM_WAKE_WORD="qi bao mei mei"
 CONFIG_CUSTOM_WAKE_WORD_DISPLAY="七宝妹妹"
 CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
-# 第二个唤醒词：只叫「七宝」也能唤醒（拼音两音节）
-CONFIG_CUSTOM_WAKE_WORD_ALT="qi bao"
-CONFIG_CUSTOM_WAKE_WORD_ALT_DISPLAY="七宝"
+# 资源包 index.json 通常只有上面这一条。另外两条在 custom_wake_word.cc 里补上：
+# 「七宝」= qi bao，「你好七宝」= ni hao qi bao。旧词不删。
 # S31 只支持 MULTINET7（mn6 仅限 S3），自定义唤醒词必须选一个 multinet 模型
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y
 

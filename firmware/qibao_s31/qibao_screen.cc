@@ -9,6 +9,7 @@
 #include "qibao_screen.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 
@@ -26,6 +27,29 @@ Rotation s_rotation = Rotation::kNormal;
 bool s_loaded = false;
 RotationChangedCallback s_rotation_cb = nullptr;
 lv_obj_t* s_layout_root = nullptr;
+PhysicalTapCallback s_tap_cb = nullptr;
+int64_t s_last_touch_us = 0;
+
+// 挂在 LVGL 已经读到的那一次坐标上。
+// GT1151 的 read_data 读完会把寄存器清 0。再开一个轮询去读，
+// 会把同一次轻点清掉：LVGL 拿到了，轮询看到 0；或者两边都错过。
+// 串口上就只有「触摸轮询已开」，没有「GT1151 按下」。
+void TouchFromLvgl(esp_lcd_touch_handle_t, uint16_t* x, uint16_t* y, uint16_t*,
+                   uint8_t* point_num, uint8_t) {
+    if (point_num == nullptr || *point_num == 0 || x == nullptr || y == nullptr) {
+        return;
+    }
+    const int64_t now = esp_timer_get_time();
+    const bool new_press = (s_last_touch_us == 0) || (now - s_last_touch_us > 80000);
+    s_last_touch_us = now;
+    if (!new_press) {
+        return;
+    }
+    ESP_LOGI(TAG, "GT1151 按下 x=%u y=%u（与 LVGL 同一次读取）", x[0], y[0]);
+    if (s_tap_cb != nullptr) {
+        s_tap_cb(x[0], y[0]);
+    }
+}
 
 // 翻转后要补画几次整屏（见 ScheduleFullRedraw 里的说明）
 int s_full_redraw_left = 0;
@@ -301,15 +325,20 @@ void ProbeFrame() {
     ProbeFrameInternal();
 }
 
+void SetPhysicalTapCallback(PhysicalTapCallback cb) {
+    s_tap_cb = cb;
+}
+
 void InitScreen(esp_lcd_touch_handle_t touch) {
-    // touch 句柄保留在签名里是为了以后要用；当前方案不需要驱动层镜像
-    // （LVGL 命中判定自带逆变换，触摸自动跟着方向走）。
-    (void)touch;
     s_disp = lv_display_get_default();
     if (s_disp == nullptr) {
         ESP_LOGE(TAG, "没有默认显示，屏幕方向功能不可用");
     }
     EnsureLoaded();
+    if (touch != nullptr && touch->config.process_coordinates == nullptr) {
+        touch->config.process_coordinates = TouchFromLvgl;
+        ESP_LOGI(TAG, "触摸跟 LVGL 同一次读取：轻点屏幕即和七宝对话");
+    }
 }
 
 void ScheduleFullRedraw() {

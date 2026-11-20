@@ -29,11 +29,15 @@
 #include <freertos/semphr.h>
 
 #include "mcp_server.h"
+#include "application.h"
+#include "qibao_display.h"
+#include "qibao_see.h"
 #include "dl_image_define.hpp"
 #include "human_face_detect.hpp"
 #include "human_face_recognition.hpp"
 
 #include "board.h"
+#include "cJSON.h"
 #include "esp_video.h"
 #include "jpg/image_to_jpeg.h"
 #include "jpg/jpeg_to_image.h"
@@ -317,7 +321,7 @@ uint8_t* rotate_rgb565_cw(const uint8_t* src, int w, int h, int angle, int* out_
 }
 
 // 抓一帧摄像头 JPEG 并解码成紧密 RGB565LE，返回缓冲（调用方释放）
-uint8_t* capture_rgb565(int* out_w, int* out_h) {
+uint8_t* capture_rgb565(int* out_w, int* out_h, bool quiet = false) {
     Camera* cam = Board::GetInstance().GetCamera();
     if (cam == nullptr) {
         ESP_LOGE(TAG, "No camera available");
@@ -325,6 +329,7 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
     }
     // ESP-IDF 默认 -fno-rtti，不能用 dynamic_cast；这块板上 GetCamera() 一定是 EspVideo。
     auto* video = static_cast<EspVideo*>(cam);
+    video->SetPreviewOnCapture(false);
     if (!cam->Capture()) {
         ESP_LOGE(TAG, "Camera capture failed");
         return nullptr;
@@ -335,8 +340,10 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
         ESP_LOGE(TAG, "No captured frame data");
         return nullptr;
     }
-    ESP_LOGI(TAG, "Captured frame: %u bytes, %ux%u, format=0x%x", (unsigned)frame_len,
-             video->GetFrameWidth(), video->GetFrameHeight(), (unsigned)video->GetFrameFormat());
+    if (!quiet) {
+        ESP_LOGI(TAG, "Captured frame: %u bytes, %ux%u, format=0x%x", (unsigned)frame_len,
+                 video->GetFrameWidth(), video->GetFrameHeight(), (unsigned)video->GetFrameFormat());
+    }
 
     // 按实际帧格式分流：
     //   JPEG  -> 硬件/软件 JPEG 解码（OV3660 那条路）
@@ -349,7 +356,7 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
         if (rgb != nullptr) {
             *out_w = kWorkWidth;
             *out_h = kWorkHeight;
-            ESP_LOGI(TAG, "UYVY -> RGB565 %dx%d", kWorkWidth, kWorkHeight);
+            if (!quiet) ESP_LOGI(TAG, "UYVY -> RGB565 %dx%d", kWorkWidth, kWorkHeight);
         }
     } else if (fmt == V4L2_PIX_FMT_JPEG) {
         rgb = decode_jpeg_tight(frame, frame_len, out_w, out_h);
@@ -371,7 +378,7 @@ uint8_t* capture_rgb565(int* out_w, int* out_h) {
             ESP_LOGE(TAG, "Frame rotate failed");
             return nullptr;
         }
-        ESP_LOGI(TAG, "Frame de-rotated %d° -> %dx%d", angle, rw, rh);
+        if (!quiet) ESP_LOGI(TAG, "Frame de-rotated %d° -> %dx%d", angle, rw, rh);
         rgb = rot;
         *out_w = rw;
         *out_h = rh;
@@ -389,7 +396,7 @@ float* extract_feature(uint8_t* rgb, int img_w, int img_h, int feature_length) {
 
     std::list<dl::detect::result_t>& detections = g_detector->run(image);
     if (detections.empty()) {
-        ESP_LOGI(TAG, "No face detected");
+        ESP_LOGD(TAG, "No face detected");
         return nullptr;
     }
     // 选最大的人脸
@@ -424,9 +431,41 @@ float* feature_from_jpeg(const unsigned char* jpg, size_t len, int feat_len) {
     return feat;
 }
 
+// 人脸模型只在真正要刷脸/录入时加载。
+// 开机就加载并跑两遍照片推理，会和已经起来的 LVGL/RGB 抢 flash cache，
+// Core 1 报 Cache error 然后整机重启，Wi-Fi 和小智语音都还没开始。
+bool EnsureModels() {
+    if (g_detector != nullptr && g_feature_model != nullptr) {
+        const int feat_len = g_feature_model->get_feat_len();
+        return feat_len > 0 && feat_len <= kMaxFeatureLength;
+    }
+    const size_t before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    // 摄像头打开后内部内存大约只剩 70KB，这时构造模型会 Load access fault。
+    // 内存还宽裕时再加载，张量走 PSRAM，加载后推理不再要这么多内部内存。
+    if (before < 120 * 1024) {
+        ESP_LOGW(TAG, "内部内存 %u，先不加载人脸模型", (unsigned)before);
+        return false;
+    }
+    ESP_LOGI(TAG, "按需加载人脸模型，加载前内部内存 %u", (unsigned)before);
+    g_detector = new HumanFaceDetect(HumanFaceDetect::MSRMNP_S8_V1, false);
+    g_feature_model = new HumanFaceFeat(HumanFaceFeat::MFN_S8_V1, false);
+    const int feat_len = g_feature_model->get_feat_len();
+    if (g_detector->get_raw_model(0) == nullptr ||
+        g_detector->get_raw_model(1) == nullptr ||
+        g_feature_model->get_raw_model() == nullptr ||
+        feat_len <= 0 || feat_len > kMaxFeatureLength) {
+        ESP_LOGE(TAG, "Face model init failed (feat_len=%d)", feat_len);
+        return false;
+    }
+    ESP_LOGI(TAG, "七宝人脸模块就绪，特征维度 %d，已录入=%d，内部内存 %u -> %u", feat_len,
+             g_owner_feature_len > 0 ? 1 : 0, (unsigned)before,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return true;
+}
+
 // 用岗哥照片自动录入 + 自检。返回是否在日志里验证了"同一人被认出"。
 bool EnrollFromReferenceAndSelfTest() {
-    if (g_feature_model == nullptr || g_detector == nullptr || !g_initialized) return false;
+    if (!g_initialized || !EnsureModels()) return false;
     const int feat_len = g_feature_model->get_feat_len();
 
     // 1) 用 enroll 帧录入
@@ -467,32 +506,33 @@ void Start() {
     if (g_initialized) return;
     g_mutex = xSemaphoreCreateMutex();
 
-    // 载入已录入的主人特征
+    // 只读已有特征，不在板级构造函数里跑检测模型。
+    // 实测：这里同步做「照片解码 + 两遍人脸推理」时，Core 1 会
+    // Guru Meditation (Cache error) 并重启，发生在 Wi-Fi / MQTT / 唤醒词加载之前。
+    // 特征已经在 TF 卡或 NVS 里，门禁基准不用每次开机重算。
     nvs_flash_init();  // 已初始化则无害
     LoadOwnerFeature();
-
-    // 初始化人脸模型（ESP32-S31 映射到 P4 模型资源）
-    g_detector = new HumanFaceDetect(HumanFaceDetect::MSRMNP_S8_V1, false);
-    g_feature_model = new HumanFaceFeat(HumanFaceFeat::MFN_S8_V1, false);
-    const int feat_len = g_feature_model->get_feat_len();
-    if (g_detector->get_raw_model(0) == nullptr ||
-        g_detector->get_raw_model(1) == nullptr ||
-        g_feature_model->get_raw_model() == nullptr ||
-        feat_len <= 0 || feat_len > kMaxFeatureLength) {
-        ESP_LOGE(TAG, "Face model init failed (feat_len=%d)", feat_len);
-        g_initialized = true;  // 标记避免重复初始化，功能降级
-        return;
-    }
     g_initialized = true;
-    ESP_LOGI(TAG, "七宝人脸模块就绪，特征维度 %d，已录入=%d", feat_len,
-             g_owner_feature_len > 0 ? 1 : 0);
-
-    // 只要还没用摄像头录过真人，开机就用岗哥照片重新录入并自检。
-    // 这样设备一上电就"认识"岗哥，不需要本人先站到镜头前录 3 张；
-    // 也会覆盖掉 TF 卡里可能残留的来路不明的特征，保证门禁基准一定来自本人照片。
-    // 一旦用户日后通过 action=enroll 用摄像头录入真人，置标记，之后开机不再覆盖。
-    if (!IsHumanEnrolled()) {
-        EnrollFromReferenceAndSelfTest();
+    xTaskCreate([](void*) {
+        for (int i = 0; i < 12; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) > 140 * 1024) {
+                EnsureModels();
+                // 不在这里预加载物品模型。实测内部内存还有 18 万时加载，
+                // 仍会把 SRAM 打到十几字节并重启。认物只留给 qobj / self.qibao.see。
+                vTaskDelete(nullptr);
+                return;
+            }
+        }
+        ESP_LOGW(TAG, "内部内存一直偏紧，人脸模型等内存松一点再加载");
+        vTaskDelete(nullptr);
+    }, "qibao_face_load", 16384, nullptr, 1, nullptr);
+    if (g_owner_feature_len > 0) {
+        ESP_LOGI(TAG, "主人特征已载入（%d 维），开机跳过照片推理，先把小智语音拉起来",
+                 g_owner_feature_len);
+    } else {
+        ESP_LOGW(TAG, "还没有主人特征。开机不跑照片推理，避免 Cache error 打断连小智。"
+                      "需要时用串口 qface / relearn");
     }
 }
 
@@ -515,6 +555,10 @@ Identity VerifyFace(bool blocking) {
     (void)blocking;  // 当前实现为同步，保留参数兼容
     if (g_mutex == nullptr || !g_initialized) return Identity::Unknown;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if (!EnsureModels()) {
+        xSemaphoreGive(g_mutex);
+        return Identity::Unknown;
+    }
 
     Identity result = Identity::Unknown;
     g_last_similarity = -1.0F;
@@ -555,9 +599,13 @@ float LastSimilarity() {
 
 bool EnrollOwnerFace(uint8_t samples, bool blocking) {
     (void)blocking;
-    if (g_mutex == nullptr || !g_initialized || g_feature_model == nullptr) return false;
+    if (g_mutex == nullptr || !g_initialized) return false;
     if (samples == 0) samples = 3;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if (!EnsureModels()) {
+        xSemaphoreGive(g_mutex);
+        return false;
+    }
 
     const int feat_len = g_feature_model->get_feat_len();
     float* sum = (float*)heap_caps_calloc((size_t)feat_len, sizeof(float),
@@ -696,28 +744,398 @@ bool CaptureCameraJpeg(std::string& jpeg, int quality) {
     return ret;
 }
 
-// ---- 异步刷脸（唤醒时触发，不阻塞语音通道） ----
-static TaskHandle_t g_verify_task = nullptr;
+enum class SeenFace : uint8_t { None, Owner, Visitor };
 
-static void verify_task(void*) {
-    Identity who = VerifyFace(true);
-    if (who == Identity::Owner) {
-        ESP_LOGI(TAG, "刷脸通过：欢迎回来，%s！解锁 10 分钟", kOwnerName);
-    } else {
-        ESP_LOGI(TAG, "刷脸未通过（sim=%.3f）：%s", LastSimilarity(),
-                 GreetingFor(Identity::Unknown).c_str());
+SeenFace ClassifyFrame(uint8_t* rgb, int w, int h) {
+    if (rgb == nullptr || !EnsureModels() || g_feature_model == nullptr) {
+        return SeenFace::None;
     }
-    g_verify_task = nullptr;
+    const int feat_len = g_feature_model->get_feat_len();
+    float* feat = extract_feature(rgb, w, h, feat_len);
+    if (feat == nullptr) {
+        return SeenFace::None;
+    }
+    SeenFace who = SeenFace::Visitor;
+    if (g_owner_feature_len == feat_len) {
+        const float sim = dot_product(feat, g_owner_feature, feat_len);
+        g_last_similarity = sim;
+        if (sim >= kRecognitionThreshold) {
+            who = SeenFace::Owner;
+        }
+    }
+    heap_caps_free(feat);
+    return who;
+}
+
+void ScaleRgb565(const uint16_t* src, int sw, int sh, uint16_t* dst, int dw, int dh) {
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    for (int y = 0; y < dh; ++y) {
+        const int sy = y * sh / dh;
+        for (int x = 0; x < dw; ++x) {
+            dst[y * dw + x] = src[sy * sw + (x * sw / dw)];
+        }
+    }
+}
+
+struct WatchState {
+    bool on = false;
+    bool large = false;
+    TaskHandle_t task = nullptr;
+    SemaphoreHandle_t mu = nullptr;
+    uint8_t* frame = nullptr;
+    int fw = 0;
+    int fh = 0;
+    SeenFace pending = SeenFace::None;
+    int pending_count = 0;
+    SeenFace shown = SeenFace::None;  // None 表示温柔默认
+    int64_t last_face_us = 0;
+    int64_t last_recog_us = 0;
+};
+
+WatchState g_watch;
+
+const char* BadgeFor(SeenFace who) {
+    if (who == SeenFace::Owner) return "岗哥";
+    if (who == SeenFace::Visitor) return "访客";
+    return "";
+}
+
+std::string InstructionFor(SeenFace who, bool camera_on) {
+    if (!camera_on) {
+        return "摄像头关着。用户要看画面时，先调用 self.qibao.camera，action=open。"
+               "语气仍对岗哥温柔。不要说自己没有眼睛。";
+    }
+    if (who == SeenFace::None) {
+        return "摄像头开着，但这几秒还没对上人脸。用户问是不是我、看到什么、在吃什么、在喝什么时，"
+               "必须调用 self.qibao.see 再看一帧。语气先对岗哥温柔。不要说自己看不到。";
+    }
+    if (who == SeenFace::Owner) {
+        return "画面里是岗哥。用温柔、亲密的语气跟他说话，可以撒娇。不要把这段说明念出来。"
+               "用户问看到什么、在吃什么、在喝什么时，必须再调用 self.qibao.see。";
+    }
+    return "画面里是访客，没有岗哥。语气不客气、凶一点，拒绝亲热。不要把这段说明念出来。"
+           "用户问看到什么时，必须再调用 self.qibao.see。";
+}
+
+void PublishViewer(const std::string& text) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "jsonrpc", "2.0");
+    cJSON_AddStringToObject(root, "method", "notifications/message");
+    cJSON* params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "level", "info");
+    cJSON_AddStringToObject(params, "logger", "qibao.viewer");
+    cJSON_AddStringToObject(params, "data", text.c_str());
+    cJSON_AddItemToObject(root, "params", params);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) return;
+    Application::GetInstance().SendMcpMessage(printed);
+    cJSON_free(printed);
+}
+
+void ObserveFace(SeenFace seen) {
+    const int64_t now = esp_timer_get_time();
+    SeenFace before = g_watch.shown;
+    if (seen == SeenFace::None) {
+        g_watch.pending_count = 0;
+        if (g_watch.last_face_us != 0 && now - g_watch.last_face_us > 4000000) {
+            g_watch.shown = SeenFace::None;
+        }
+    } else {
+        g_watch.last_face_us = now;
+        if (seen == g_watch.pending) {
+            g_watch.pending_count++;
+        } else {
+            g_watch.pending = seen;
+            g_watch.pending_count = 1;
+        }
+        if (g_watch.pending_count >= 2) {
+            g_watch.shown = seen;
+        }
+    }
+    if (g_watch.shown != before) {
+        ESP_LOGI(TAG, "语气切换：%s", InstructionFor(g_watch.shown, true).c_str());
+        PublishViewer(InstructionFor(g_watch.shown, true));
+    }
+}
+
+void CameraTask(void*) {
+    while (g_watch.on) {
+        int w = 0, h = 0;
+        uint8_t* rgb = nullptr;
+        if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+        rgb = capture_rgb565(&w, &h, true);
+        if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+        if (rgb != nullptr && g_watch.mu != nullptr) {
+            xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+            heap_caps_free(g_watch.frame);
+            g_watch.frame = rgb;
+            g_watch.fw = w;
+            g_watch.fh = h;
+            xSemaphoreGive(g_watch.mu);
+            rgb = nullptr;
+        }
+        const int64_t now = esp_timer_get_time();
+        const auto talk = Application::GetInstance().GetDeviceState();
+        const bool speaking = talk == kDeviceStateSpeaking;
+        const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        // 正在播语音时不跑网络。内部内存低于 20KB 也不跑，免得把 MQTT 挤断。
+        // 张量优先放 PSRAM（模型构造时限制了内部内存），所以不再要求 120KB。
+        if (!speaking && internal_free > 20 * 1024 && g_watch.frame != nullptr &&
+            now - g_watch.last_recog_us > 2000000) {
+            g_watch.last_recog_us = now;
+            uint8_t* copy = nullptr;
+            int cw = 0, ch = 0;
+            xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+            if (g_watch.frame != nullptr && g_watch.fw > 0) {
+                const size_t n = (size_t)g_watch.fw * g_watch.fh * 2;
+                copy = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (copy != nullptr) {
+                    std::memcpy(copy, g_watch.frame, n);
+                    cw = g_watch.fw;
+                    ch = g_watch.fh;
+                }
+            }
+            xSemaphoreGive(g_watch.mu);
+            if (copy != nullptr) {
+                // 和 DescribeScene 共用同一套人脸模型，不能两头同时跑。
+                if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+                const SeenFace seen = ClassifyFrame(copy, cw, ch);
+                if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+                heap_caps_free(copy);
+                ObserveFace(seen);
+            }
+        } else if (g_watch.frame == nullptr) {
+            ObserveFace(SeenFace::None);
+        }
+        heap_caps_free(rgb);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    if (g_watch.mu != nullptr) {
+        xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+        heap_caps_free(g_watch.frame);
+        g_watch.frame = nullptr;
+        g_watch.fw = 0;
+        g_watch.fh = 0;
+        xSemaphoreGive(g_watch.mu);
+    }
+    g_watch.task = nullptr;
     vTaskDelete(nullptr);
 }
 
-static void trigger_async_verify() {
-    if (g_verify_task != nullptr) return;  // 已有刷脸任务在跑
-    xTaskCreate(verify_task, "qibao_verify", 8192, nullptr, 2, &g_verify_task);
+void SetCameraWatch(bool on) {
+    if (on == g_watch.on) return;
+    if (on) {
+        if (g_watch.task != nullptr) {
+            ESP_LOGW(TAG, "上一个预览还在退出，稍后再开");
+            return;
+        }
+        if (g_watch.mu == nullptr) g_watch.mu = xSemaphoreCreateMutex();
+        if (Camera* cam = Board::GetInstance().GetCamera()) {
+            static_cast<EspVideo*>(cam)->SetPreviewOnCapture(false);
+        }
+        g_watch.on = true;
+        g_watch.shown = SeenFace::None;
+        g_watch.pending_count = 0;
+        g_watch.last_face_us = 0;
+        g_watch.last_recog_us = 0;
+        if (xTaskCreate(CameraTask, "qibao_cam", 16384, nullptr, 1, &g_watch.task) != pdPASS) {
+            g_watch.on = false;
+            ESP_LOGE(TAG, "摄像头预览任务没起来，先保语音");
+        } else {
+            ESP_LOGI(TAG, "摄像头预览开了（不在开机时自动开）");
+        }
+    } else {
+        g_watch.on = false;
+        g_watch.large = false;
+        g_watch.shown = SeenFace::None;
+        ESP_LOGI(TAG, "摄像头预览关了，语气回到对岗哥的温柔");
+    }
+}
+
+bool CameraWatchOn() { return g_watch.on; }
+bool CameraWatchLarge() { return g_watch.large; }
+void SetCameraWatchLarge(bool large) { g_watch.large = large && g_watch.on; }
+
+bool CopyLatestFrame(uint8_t* dst, int dst_w, int dst_h) {
+    if (dst == nullptr || dst_w <= 0 || dst_h <= 0 || g_watch.mu == nullptr) return false;
+    xSemaphoreTake(g_watch.mu, portMAX_DELAY);
+    const bool ok = g_watch.frame != nullptr && g_watch.fw > 0 && g_watch.fh > 0;
+    if (ok) {
+        ScaleRgb565(reinterpret_cast<uint16_t*>(g_watch.frame), g_watch.fw, g_watch.fh,
+                    reinterpret_cast<uint16_t*>(dst), dst_w, dst_h);
+    }
+    xSemaphoreGive(g_watch.mu);
+    return ok;
+}
+
+const char* ViewerBadge() {
+    if (!g_watch.on) return "";
+    const char* face = BadgeFor(g_watch.shown);
+    if (face[0] != '\0') return face;
+    const char* thing = ObjectBadge();
+    return thing != nullptr ? thing : "";
+}
+
+std::string UnwrapExplain(const std::string& raw) {
+    cJSON* root = cJSON_Parse(raw.c_str());
+    if (root == nullptr) return raw;
+    const char* keys[] = {"result", "text", "content", "answer", "response"};
+    for (const char* key : keys) {
+        cJSON* item = cJSON_GetObjectItem(root, key);
+        if (cJSON_IsString(item) && item->valuestring != nullptr && item->valuestring[0] != '\0') {
+            std::string text = item->valuestring;
+            cJSON_Delete(root);
+            return text;
+        }
+    }
+    cJSON_Delete(root);
+    return raw;
+}
+
+bool SceneNeedsReminder(const std::string& scene) {
+    auto has = [&](const char* s) { return scene.find(s) != std::string::npos; };
+    if (!has("喝的=") && !has("吃的=")) return false;
+    return has("喝的=可乐") || has("喝的=汽水") || has("喝的=含糖") || has("吃的=零食") ||
+           has("吃的=高糖");
+}
+
+std::string LookOnce() {
+    if (!CameraWatchOn()) {
+        ShowLivePreview(true);
+    }
+    int w = 0, h = 0;
+    uint8_t* rgb = GrabRgb565(&w, &h);
+    SeenFace who = SeenFace::None;
+    if (rgb != nullptr) {
+        if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+        who = ClassifyFrame(rgb, w, h);
+        if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+        g_watch.shown = who;
+        g_watch.pending = who;
+        g_watch.pending_count = 2;
+        if (who != SeenFace::None) g_watch.last_face_us = esp_timer_get_time();
+    }
+
+    std::string face;
+    if (who == SeenFace::Owner) {
+        face = "本地人脸：这是岗哥本人。";
+    } else if (who == SeenFace::Visitor) {
+        face = "本地人脸：画面里有人，但不是岗哥，是访客。";
+    } else if (rgb == nullptr) {
+        face = "本地人脸：这帧没有抓到画面。";
+    } else {
+        face = "本地人脸：这帧没有看清人脸，不能确定是不是岗哥。请正对镜头再问一次。";
+    }
+
+    const char* question =
+        "请只用中文，只根据画面回答，不要编造。必须先写两句："
+        "喝的=无 或 喝的=可乐 或 喝的=汽水 或 喝的=含糖 或 喝的=其他饮料；"
+        "吃的=无 或 吃的=零食 或 吃的=高糖甜食 或 吃的=其他食物。"
+        "可乐、汽水、奶茶算含糖饮料。薯片、糖果、蛋糕、巧克力、饼干算高糖。"
+        "看不清就写喝的=无，吃的=无。然后再用一句话说明人在做什么。";
+
+    std::string scene = "云端这帧没看成。";
+    auto* cam = Board::GetInstance().GetCamera();
+    auto* video = static_cast<EspVideo*>(cam);
+    if (rgb == nullptr || video == nullptr) {
+        scene = "没有可看的画面。";
+    } else if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 40 * 1024) {
+        scene = "这会儿内部内存紧，没有把画面送给云端，避免语音重启。只能先认人。";
+    } else if (!video->ExplainReady()) {
+        scene = "云端看图还没就绪，这次只能认人，认不出可乐和零食。";
+    } else {
+        if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+        video->SetPreviewOnCapture(false);
+        auto explained = video->ExplainImage(rgb, (size_t)w * h * 2, (uint16_t)w, (uint16_t)h,
+                                             V4L2_PIX_FMT_RGB565, question);
+        if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+        if (!explained) {
+            scene = std::string("云端这帧没看成：") + explained.error();
+        } else {
+            std::string body = UnwrapExplain(*explained);
+            if (body.size() > 600) body.resize(600);
+            scene = std::string("云端看到的画面：") + body;
+        }
+    }
+    heap_caps_free(rgb);
+
+    std::string text = face + scene;
+    // 脸没对上但云端看到人在喝可乐、吃甜食时，也按对岗哥的语气提醒。
+    // 仰头、侧脸时本机特征经常对不上，不能因此把提醒丢掉。
+    if (who != SeenFace::Visitor && SceneNeedsReminder(scene)) {
+        text += "请用一句温柔的话提醒少喝可乐、少吃高糖零食，不要凶，不要连着说很多次。";
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+            Application::GetInstance().Schedule([]() {
+                if (auto* display = Board::GetInstance().GetDisplay()) {
+                    display->SetChatMessage("system", "岗哥，可乐和甜食少一点");
+                }
+            });
+        }
+    } else if (who == SeenFace::Visitor) {
+        text += "这是访客，语气不客气。";
+    } else {
+        text += "不要说自己没有眼睛或看不到。看不清就说这帧没看清，请他正对镜头。";
+    }
+    text += "不要把这段说明原文念出来。这不是门锁。";
+    ESP_LOGI(TAG, "看画面：%s", text.c_str());
+    return text;
+}
+
+std::string ViewerInstruction() {
+    return InstructionFor(g_watch.on ? g_watch.shown : SeenFace::None, g_watch.on);
+}
+
+std::string DescribeScene() {
+    struct Job {
+        SemaphoreHandle_t done;
+        std::string text;
+    };
+    auto* job = new Job{xSemaphoreCreateBinary(), {}};
+    if (job->done == nullptr ||
+        xTaskCreate([](void* arg) {
+            auto* job = static_cast<Job*>(arg);
+            job->text = LookOnce();
+            xSemaphoreGive(job->done);
+            vTaskDelete(nullptr);
+        }, "qibao_look", 16384, job, 1, nullptr) != pdPASS) {
+        if (job->done != nullptr) vSemaphoreDelete(job->done);
+        delete job;
+        return "这会儿看不了画面，请再问一次。不要说自己看不到。";
+    }
+    std::string text;
+    if (xSemaphoreTake(job->done, pdMS_TO_TICKS(28000)) == pdTRUE) {
+        text = std::move(job->text);
+        vSemaphoreDelete(job->done);
+        delete job;
+    } else {
+        // 任务还在用这块内存，超时就留着，避免它写到已释放的对象上。
+        ESP_LOGW(TAG, "看画面超时");
+        text = "看画面超时。请再问一次是不是你、手里有什么。不要说自己看不到。";
+    }
+    return text;
+}
+
+uint8_t* GrabRgb565(int* w, int* h) {
+    if (g_mutex != nullptr) xSemaphoreTake(g_mutex, portMAX_DELAY);
+    uint8_t* rgb = capture_rgb565(w, h, true);
+    if (g_mutex != nullptr) xSemaphoreGive(g_mutex);
+    return rgb;
+}
+
+void ShowLivePreview(bool on) {
+    SetCameraWatch(on);
+    if (QibaoLcdDisplay* view = QibaoLcdDisplay::Instance()) {
+        view->SyncCameraChrome();
+    }
+    ESP_LOGI(TAG, "实时预览 %s（和点右上角相机按钮是同一条）", on ? "开" : "关");
 }
 
 void StartBridge() {
     Start();  // 初始化人脸 + 载入 NVS 特征
+    // 不要在这里调用 Board::GetInstance()。本函数就在板子构造函数里，
+    // GetInstance 的静态初始化还没完成，再进去会卡住，Wi-Fi 和语音都起不来。
+    // 半屏静帧默认关闭，见 EspVideo::preview_on_capture_。
 
     // 注册一个 MCP 工具，让大模型能主动查门禁状态/触发刷脸/录入
     auto& mcp = McpServer::GetInstance();
@@ -759,22 +1177,84 @@ void StartBridge() {
         });
 
     ESP_LOGI(TAG, "七宝门禁 MCP 工具已注册");
+
+    mcp.AddTool(
+        "self.qibao.viewer",
+        "摄像头前这几秒大概是谁，用来决定语气。不要用本工具回答「你看到什么」「我在吃什么」「我在喝什么」。\n"
+        "那些问题必须调用 self.qibao.see。\n"
+        "返回里若是岗哥：温柔、亲密，可以撒娇。\n"
+        "返回里若是访客：不客气、凶一点。\n"
+        "这不是门锁。不要说自己没有眼睛或看不到。不要把返回原文念出来。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            return ViewerInstruction();
+        });
+    ESP_LOGI(TAG, "七宝语气工具已注册：self.qibao.viewer");
+
+    mcp.AddTool(
+        "self.qibao.camera",
+        "打开或关闭实时摄像头。用户说打开摄像头、关掉摄像头、视频通话时调用本工具，"
+        "不要改用 self.camera.take_photo。\n"
+        "action=open：七宝仍占大画面，右上角出现摄像头实时小窗。\n"
+        "action=close：关闭摄像头。\n"
+        "action=status：查询开没开。\n"
+        "这是和屏幕右上角相机按钮相同的实时画面，不是拍一张照片。",
+        PropertyList({
+            Property("action", kPropertyTypeString, std::string("open")).SetMaxLength(16),
+        }),
+        [](const PropertyList& p) -> ReturnValue {
+            std::string action = p["action"].value<std::string>();
+            if (action == "close") {
+                ShowLivePreview(false);
+                return std::string("摄像头已关闭");
+            }
+            if (action == "status") {
+                return CameraWatchOn() ? std::string("摄像头开着，右上角是实时小窗")
+                                       : std::string("摄像头关着");
+            }
+            ShowLivePreview(true);
+            return CameraWatchOn() ? std::string("实时画面已打开：七宝在大画面，摄像头在右上角小窗")
+                                   : std::string("实时画面没打开，预览任务没有起来");
+        });
+    ESP_LOGI(TAG, "实时摄像头工具已注册：self.qibao.camera");
+
+    mcp.AddTool(
+        "self.qibao.see",
+        "当场看一帧摄像头。用户问「是不是我」「你看到什么」「我在干什么」「在吃什么」「在喝什么」时必须调用。\n"
+        "先用本机人脸判断是不是岗哥，再把画面送给云端，认出可乐、汽水、零食、糖果、蛋糕这类高糖食物。\n"
+        "如果是岗哥并且在喝可乐或吃高糖零食，用一句温柔的话提醒他少喝可乐、少吃高糖零食。\n"
+        "不要说自己没有眼睛、看不到、不知道。看不清就请他正对镜头再看一次。\n"
+        "不要把返回原文整段念出来。这不是门锁。",
+        PropertyList(),
+        [](const PropertyList&) -> ReturnValue {
+            return DescribeScene();
+        });
+    ESP_LOGI(TAG, "认人认物工具已注册：self.qibao.see");
 }
 
 }  // namespace qibao
 
+// self.camera.take_photo 讲解完这一帧之后调用。
+// 打开的是和屏幕按钮同一条实时小窗，不再铺半屏静帧。
+void QibaoOnPhotoTool() {
+    qibao::ShowLivePreview(true);
+}
+
 // ---- 给 application.cc 的 C 弱符号实现 ----
 extern "C" bool QibaoGateAllowed(const char* command) {
+    (void)command;
     // 没录入主人人脸 = 功能降级模式，放行（避免把自己锁在外面）
     if (!qibao::HasOwnerFace()) return true;
     // 已解锁（10 分钟内）直接放行
     if (qibao::IsUnlocked()) return true;
-    // 未解锁：拒绝，并异步刷脸，用户再说一次即可
-    qibao::trigger_async_verify();
-    ESP_LOGW(TAG, "[Qibao] 未解锁，拒绝控制指令，已触发异步刷脸");
+    // 未解锁只拒绝本机控制指令，不要在语音会话里启动摄像头+人脸模型。
+    // 那条推理和屏幕/音频抢 cache，会把正在进行的小智对话直接重启掉。
+    // 想解锁用串口 qface（空闲时刷一次）。
+    ESP_LOGW(TAG, "[Qibao] 未解锁，拒绝控制指令（不在对话中启动刷脸）");
     return false;
 }
 
 extern "C" void QibaoOnWake() {
-    qibao::trigger_async_verify();
+    // 唤醒瞬间不要刷脸。语音通道要先连上、先能对话。
+    ESP_LOGI(TAG, "唤醒：先进行语音对话，本次不跑刷脸");
 }

@@ -7,8 +7,9 @@
 //   - 保持原比例（不拉伸变形），高度铺满屏幕，居中显示；
 //   - 屏幕背景设成与原图一致的米灰渐变，左右留白自然融合，看起来像一整张铺满的图；
 //   - 图片以压缩 JPG 编进固件（省 flash），启动时解码到 PSRAM；
-//   - **不再自动轮播**：改成手动切换 —— 点一下图片就在站姿/坐姿之间柔和淡入淡出；
+//   - 轻点画面任意处（除左下角小旋转按钮）就和七宝开始/结束对话，不用找板子上的按键；
 //   - 左下角有一个旋转按钮，点一下转 90°（这块板没有加速度计，只能手动）。
+//   - 换站姿/坐姿仍可用串口 qpose，不再占用轻点。
 //
 // ---------------------------------------------------------------------------
 // 四挡方向是怎么做的（核心原理见 qibao_screen.h 的注释）
@@ -30,7 +31,10 @@
 #include "display/lcd_display.h"
 #include "qibao_frames.h"
 #include "qibao_screen.h"
+#include "qibao_persona.h"
+#include "application.h"
 
+#include <cstring>
 #include <esp_heap_caps.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
@@ -77,6 +81,13 @@ public:
         ApplyBackdrop();                   // 米灰渐变背景 + 让原生容器透明
         CreatePersonaImages();             // 人物图（解码结果按朝向缓存，不重复解码）
         CreateRotateButton();              // 左下角旋转按钮
+        CreateCameraUi();                  // 右上角摄像头按钮 + 小窗（关着就只有按钮）
+        CreateTalkLayer();                 // 备用：物理屏上的透明层
+        qibao::SetPhysicalTapCallback([](int x, int y) {
+            if (QibaoLcdDisplay* self = QibaoLcdDisplay::Instance()) {
+                self->HandlePhysicalTap(x, y);
+            }
+        });
 
         // 【关键】界面建完了，现在才能安全地套上旋转变换。
         // 原因见 qibao_screen.h 的说明 6：界面没建就设 transform，
@@ -140,6 +151,97 @@ public:
 
     // 当前实例（串口命令 qpose 用）
     static QibaoLcdDisplay* Instance() { return s_instance_; }
+
+    // GT1151 直接报上来的按下。不经过会跟着画面旋转的 LVGL 热区。
+    // 给语音工具用：摄像头任务已经改好开关之后，把右上角小窗显示出来。
+    void LogHitBoxes() {
+        auto dump = [](const char* name, lv_obj_t* obj) {
+            if (obj == nullptr) {
+                ESP_LOGI(TAG, "热区 %s 不存在", name);
+                return;
+            }
+            lv_area_t area;
+            lv_obj_get_coords(obj, &area);
+            lv_obj_get_transformed_area(obj, &area, LV_OBJ_POINT_TRANSFORM_FLAG_RECURSIVE);
+            ESP_LOGI(TAG, "热区 %s [%ld,%ld]-[%ld,%ld] hidden=%d", name,
+                     (long)area.x1, (long)area.y1, (long)area.x2, (long)area.y2,
+                     lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) ? 1 : 0);
+        };
+        dump("cam", cam_btn_);
+        dump("pip", pip_box_);
+        dump("close", pip_close_);
+        dump("rot", rotate_btn_);
+    }
+
+    void SyncCameraChrome() {
+        DisplayLockGuard lock(this);
+        ApplyCameraMode();
+    }
+
+    // 小智自带的 self.camera.take_photo 会把一张半屏静帧铺到画面中间。
+    // 这块 SC101IOT 是 UYVY，那张静帧不是右上角实时小窗，用户看到的是一块黑的。
+    // 这里直接丢掉，不让它盖住七宝。实时画面由 self.qibao.camera 打开。
+    void SetPreviewImage(std::unique_ptr<LvglImage> image) override {
+        DisplayLockGuard lock(this);
+        if (preview_image_ != nullptr) {
+            lv_obj_add_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (preview_timer_ != nullptr) {
+            esp_timer_stop(preview_timer_);
+        }
+        image.reset();
+        preview_image_cached_.reset();
+        ESP_LOGI(TAG, "丢掉拍照静帧，不显示半屏黑块");
+    }
+
+    void HandlePhysicalTap(int x, int y) {
+        DisplayLockGuard lock(this);
+        static int64_t last_us = 0;
+        const int64_t now = esp_timer_get_time();
+        if (now - last_us < 600000) {
+            return;
+        }
+        // 用转完之后的可见区域和物理屏坐标比。
+        // 90° 时布局坐标是负的、转过的，只拿未旋转的 coords 去比，小窗会点不中，
+        // 这一下就掉进开始/结束对话，对调不会发生。
+        auto hit = [&](lv_obj_t* obj, int pad) {
+            if (obj == nullptr || lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) return false;
+            lv_area_t area;
+            lv_obj_get_coords(obj, &area);
+            lv_obj_get_transformed_area(obj, &area, LV_OBJ_POINT_TRANSFORM_FLAG_RECURSIVE);
+            lv_area_increase(&area, pad, pad);
+            return x >= area.x1 && x <= area.x2 && y >= area.y1 && y <= area.y2;
+        };
+        if (hit(rotate_btn_, 16)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点落在旋转按钮 (%d,%d)", x, y);
+            qibao::ToggleRotation();
+            return;
+        }
+        if (hit(cam_btn_, 12)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点摄像头按钮 (%d,%d)", x, y);
+            ToggleCamera();
+            return;
+        }
+        if (hit(pip_close_, 8)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点小窗关闭 (%d,%d)", x, y);
+            qibao::SetCameraWatch(false);
+            ApplyCameraMode();
+            return;
+        }
+        if (hit(pip_box_, 20)) {
+            last_us = now;
+            ESP_LOGI(TAG, "轻点小窗，对调大小 (%d,%d)", x, y);
+            qibao::SetCameraWatchLarge(!qibao::CameraWatchLarge());
+            ApplyCameraMode();
+            return;
+        }
+        last_us = now;
+        ESP_LOGI(TAG, "轻触屏幕 (%d,%d)：和七宝开始/结束对话", x, y);
+        Application::GetInstance().ToggleChatState();
+    }
 
     // ---------------------------------------------------------------------------
     // 忠实快照：直接读「正在送显的那块缓冲」。
@@ -218,10 +320,24 @@ private:
     FrameSet frames_[2];  // [0]=横屏(480 高)  [1]=竖屏(800 高)
 
     lv_obj_t* layout_root_ = nullptr;  // 布局根容器（整套界面挂在它下面）
+    lv_obj_t* talk_hit_ = nullptr;     // 贴在物理屏上的轻点层，不跟布局一起转
     int root_w_ = 0;
     int root_h_ = 0;
     lv_obj_t* imgs_[2] = {nullptr, nullptr};
     lv_obj_t* rotate_btn_ = nullptr;
+    lv_obj_t* cam_btn_ = nullptr;
+    lv_obj_t* pip_box_ = nullptr;
+    lv_obj_t* pip_img_ = nullptr;
+    lv_obj_t* pip_label_ = nullptr;
+    lv_obj_t* pip_close_ = nullptr;
+    lv_obj_t* cam_full_ = nullptr;
+    lv_timer_t* cam_timer_ = nullptr;
+    uint8_t* pip_px_ = nullptr;
+    uint8_t* full_px_ = nullptr;
+    lv_image_dsc_t pip_dsc_{};
+    lv_image_dsc_t full_dsc_{};
+    int pip_w_ = 0;
+    int pip_h_ = 0;
     int cur_frame_ = 0;
 
     // ---------------------------------------------------------------------------
@@ -264,6 +380,24 @@ private:
         imgs_[0] = nullptr;
         imgs_[1] = nullptr;
         rotate_btn_ = nullptr;
+        cam_btn_ = nullptr;
+        pip_box_ = nullptr;
+        pip_img_ = nullptr;
+        pip_label_ = nullptr;
+        pip_close_ = nullptr;
+        cam_full_ = nullptr;
+        if (cam_timer_ != nullptr) {
+            lv_timer_delete(cam_timer_);
+            cam_timer_ = nullptr;
+        }
+        heap_caps_free(pip_px_);
+        pip_px_ = nullptr;
+        heap_caps_free(full_px_);
+        full_px_ = nullptr;
+        if (talk_hit_ != nullptr) {
+            lv_obj_del(talk_hit_);
+            talk_hit_ = nullptr;
+        }
         lv_obj_del(layout_root_);
         layout_root_ = nullptr;
         qibao::SetLayoutRootHandle(nullptr);
@@ -341,9 +475,8 @@ private:
             lv_image_set_src(img, dsc);
             lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
             lv_obj_set_style_image_recolor_opa(img, LV_OPA_TRANSP, 0);
-            // 点一下图片就切换站姿/坐姿（手动，不再自动滚动）
-            lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_add_event_cb(img, OnImageClicked, LV_EVENT_CLICKED, this);
+            // 人物图本身不吃触摸。轻点交给上面的透明层，用来开口说话。
+            lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
             imgs_[i] = img;
         }
         if (imgs_[0] != nullptr) lv_obj_move_foreground(imgs_[0]);
@@ -352,7 +485,7 @@ private:
         cur_frame_ = 0;
         if (imgs_[1] != nullptr) {
             lv_obj_set_style_opa(imgs_[1], LV_OPA_TRANSP, 0);
-            ESP_LOGI(TAG, "七宝完整全身图 x2 已显示（点图片换姿势，左下角按钮转 90°）");
+            ESP_LOGI(TAG, "七宝完整全身图 x2 已显示（轻点画面说话，左下角按钮转 90°）");
         } else {
             ESP_LOGI(TAG, "七宝完整全身图 x1 已显示（静态）");
         }
@@ -375,12 +508,232 @@ private:
         return fs.ok[0] || fs.ok[1];
     }
 
-    // 点图片 → 换姿势
-    static void OnImageClicked(lv_event_t* e) {
-        auto* self = static_cast<QibaoLcdDisplay*>(lv_event_get_user_data(e));
-        if (self != nullptr) {
-            self->SwitchPose();
+    // 手指点在旋转按钮的可见位置上吗？
+    // 按钮画在已经旋转的布局里，触摸点是物理屏坐标，要先按布局的逆变换换算。
+    bool HitsRotateButton(lv_point_t screen_pt) const {
+        if (rotate_btn_ == nullptr || layout_root_ == nullptr) {
+            return false;
         }
+        lv_obj_transform_point(layout_root_, &screen_pt, LV_OBJ_POINT_TRANSFORM_FLAG_INVERSE);
+        lv_area_t area;
+        lv_obj_get_coords(rotate_btn_, &area);
+        lv_area_increase(&area, 16, 16);
+        return screen_pt.x >= area.x1 && screen_pt.x <= area.x2 &&
+               screen_pt.y >= area.y1 && screen_pt.y <= area.y2;
+    }
+
+    // 轻点物理屏 → 和七宝开始或结束这一轮对话（等同短按 BOOT/MODE、串口 qtalk）。
+    // 用 PRESSED 而不是 CLICKED：点一下就开口，不要求按下和松开还落在同一个旋转后的控件上。
+    static void OnScreenPressed(lv_event_t* e) {
+        if (lv_event_get_code(e) != LV_EVENT_PRESSED) {
+            return;
+        }
+        auto* self = static_cast<QibaoLcdDisplay*>(lv_event_get_user_data(e));
+        if (self == nullptr) {
+            return;
+        }
+        lv_point_t p = {0, 0};
+        lv_indev_t* indev = lv_indev_active();
+        if (indev != nullptr) {
+            lv_indev_get_point(indev, &p);
+        }
+        self->HandlePhysicalTap(p.x, p.y);
+    }
+
+    // 轻点层贴在物理屏（800x480）上，不放进会旋转的布局根。
+    // 上一版把透明层放进布局根：竖屏时布局是 480x800 再转 90°，
+    // 触摸仍是物理屏坐标，热区和手指对不上，CLICKED 根本不会进 ToggleChatState。
+    // 串口 qtalk 不经过这块热区，所以只有它能进 listening。
+    void CreateTalkLayer() {
+        if (talk_hit_ != nullptr) {
+            lv_obj_del(talk_hit_);
+            talk_hit_ = nullptr;
+        }
+        talk_hit_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(talk_hit_, kScreenW, kScreenH);
+        lv_obj_set_pos(talk_hit_, 0, 0);
+        lv_obj_set_style_bg_opa(talk_hit_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(talk_hit_, 0, 0);
+        lv_obj_set_style_pad_all(talk_hit_, 0, 0);
+        lv_obj_set_style_radius(talk_hit_, 0, 0);
+        lv_obj_remove_flag(talk_hit_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(talk_hit_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(talk_hit_, LV_OBJ_FLAG_FLOATING);
+        lv_obj_add_event_cb(talk_hit_, OnScreenPressed, LV_EVENT_PRESSED, this);
+        lv_obj_move_foreground(talk_hit_);
+    }
+
+    void MakeRgbDsc(lv_image_dsc_t* dsc, uint8_t* px, int w, int h) {
+        dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+        dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+        dsc->header.w = (uint32_t)w;
+        dsc->header.h = (uint32_t)h;
+        dsc->header.stride = (uint32_t)w * 2;
+        dsc->data_size = (uint32_t)w * h * 2;
+        dsc->data = px;
+    }
+
+    void ToggleCamera() {
+        if (qibao::CameraWatchOn()) {
+            qibao::SetCameraWatch(false);
+        } else {
+            qibao::SetCameraWatch(true);
+        }
+        ApplyCameraMode();
+    }
+
+    void ApplyCameraMode() {
+        const bool on = qibao::CameraWatchOn();
+        const bool large = on && qibao::CameraWatchLarge();
+        if (cam_btn_ != nullptr) {
+            lv_obj_set_style_bg_color(cam_btn_,
+                                      lv_color_hex(on ? 0xC4554A : 0x3A3A3A), 0);
+        }
+        if (pip_box_ != nullptr) {
+            if (on) lv_obj_remove_flag(pip_box_, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(pip_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (cam_full_ != nullptr) {
+            if (large) lv_obj_remove_flag(cam_full_, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(cam_full_, LV_OBJ_FLAG_HIDDEN);
+        }
+        for (lv_obj_t* img : imgs_) {
+            if (img == nullptr) continue;
+            if (large) lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_remove_flag(img, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (pip_img_ != nullptr && pip_box_ != nullptr) {
+            if (large && imgs_[cur_frame_] != nullptr) {
+                lv_image_set_src(pip_img_, lv_image_get_src(imgs_[cur_frame_]));
+            } else if (pip_px_ != nullptr) {
+                lv_image_set_src(pip_img_, &pip_dsc_);
+            }
+        }
+        if (on && cam_timer_ == nullptr) {
+            cam_timer_ = lv_timer_create([](lv_timer_t* timer) {
+                auto* self = static_cast<QibaoLcdDisplay*>(lv_timer_get_user_data(timer));
+                if (self != nullptr) self->RefreshCameraFrame();
+            }, 200, this);
+        }
+        if (!on && cam_timer_ != nullptr) {
+            lv_timer_delete(cam_timer_);
+            cam_timer_ = nullptr;
+        }
+        if (pip_label_ != nullptr) {
+            const char* badge = qibao::ViewerBadge();
+            lv_label_set_text(pip_label_, badge != nullptr ? badge : "");
+        }
+    }
+
+    void RefreshCameraFrame() {
+        if (!qibao::CameraWatchOn()) return;
+        if (qibao::CameraWatchLarge()) {
+            if (full_px_ != nullptr &&
+                qibao::CopyLatestFrame(full_px_, root_w_, root_h_) && cam_full_ != nullptr) {
+                lv_obj_invalidate(cam_full_);
+            }
+        } else if (pip_px_ != nullptr &&
+                   qibao::CopyLatestFrame(pip_px_, pip_w_, pip_h_) && pip_img_ != nullptr) {
+            lv_image_set_src(pip_img_, &pip_dsc_);
+            lv_obj_invalidate(pip_img_);
+        }
+        if (pip_label_ != nullptr) {
+            const char* badge = qibao::ViewerBadge();
+            lv_label_set_text(pip_label_, badge != nullptr ? badge : "");
+        }
+    }
+
+    void CreateCameraUi() {
+        if (layout_root_ == nullptr) return;
+        pip_w_ = root_w_ > root_h_ ? 200 : 168;
+        pip_h_ = pip_w_ * 3 / 4;
+        const int btn = 56;
+        const int bx = root_w_ - 12 - btn;
+        const int by = 42;
+        const int px = root_w_ - 12 - pip_w_;
+        const int py = by + btn + 8;
+
+        cam_btn_ = lv_btn_create(layout_root_);
+        lv_obj_set_size(cam_btn_, btn, btn);
+        lv_obj_set_pos(cam_btn_, bx, by);
+        lv_obj_set_style_radius(cam_btn_, btn / 2, 0);
+        lv_obj_set_style_bg_color(cam_btn_, lv_color_hex(0x3A3A3A), 0);
+        lv_obj_set_style_border_width(cam_btn_, 2, 0);
+        lv_obj_set_style_border_color(cam_btn_, lv_color_hex(0xF4EFE6), 0);
+        lv_obj_t* lens = lv_obj_create(cam_btn_);
+        lv_obj_set_size(lens, 22, 22);
+        lv_obj_center(lens);
+        lv_obj_set_style_radius(lens, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(lens, lv_color_hex(0xF4EFE6), 0);
+        lv_obj_set_style_border_width(lens, 0, 0);
+        lv_obj_remove_flag(lens, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* hole = lv_obj_create(lens);
+        lv_obj_set_size(hole, 10, 10);
+        lv_obj_center(hole);
+        lv_obj_set_style_radius(hole, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(hole, lv_color_hex(0x3A3A3A), 0);
+        lv_obj_set_style_border_width(hole, 0, 0);
+        lv_obj_remove_flag(hole, LV_OBJ_FLAG_CLICKABLE);
+
+        pip_box_ = lv_obj_create(layout_root_);
+        lv_obj_set_size(pip_box_, pip_w_, pip_h_);
+        lv_obj_set_pos(pip_box_, px, py);
+        lv_obj_set_style_radius(pip_box_, 12, 0);
+        lv_obj_set_style_bg_color(pip_box_, lv_color_hex(0x1C1C1C), 0);
+        lv_obj_set_style_border_width(pip_box_, 3, 0);
+        lv_obj_set_style_border_color(pip_box_, lv_color_hex(0xF4EFE6), 0);
+        lv_obj_set_style_pad_all(pip_box_, 0, 0);
+        lv_obj_set_style_clip_corner(pip_box_, true, 0);
+        lv_obj_remove_flag(pip_box_, LV_OBJ_FLAG_SCROLLABLE);
+
+        pip_px_ = (uint8_t*)heap_caps_malloc((size_t)pip_w_ * pip_h_ * 2,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (pip_px_ != nullptr) {
+            std::memset(pip_px_, 0, (size_t)pip_w_ * pip_h_ * 2);
+            MakeRgbDsc(&pip_dsc_, pip_px_, pip_w_, pip_h_);
+        }
+        full_px_ = (uint8_t*)heap_caps_malloc((size_t)root_w_ * root_h_ * 2,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (full_px_ != nullptr) {
+            std::memset(full_px_, 0, (size_t)root_w_ * root_h_ * 2);
+            MakeRgbDsc(&full_dsc_, full_px_, root_w_, root_h_);
+        }
+
+        pip_img_ = lv_image_create(pip_box_);
+        if (pip_px_ != nullptr) lv_image_set_src(pip_img_, &pip_dsc_);
+        lv_obj_center(pip_img_);
+        lv_obj_remove_flag(pip_img_, LV_OBJ_FLAG_CLICKABLE);
+
+        pip_label_ = lv_label_create(pip_box_);
+        lv_label_set_text(pip_label_, "");
+        lv_obj_align(pip_label_, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+        lv_obj_set_style_text_color(pip_label_, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_remove_flag(pip_label_, LV_OBJ_FLAG_CLICKABLE);
+
+        pip_close_ = lv_btn_create(pip_box_);
+        lv_obj_set_size(pip_close_, 28, 28);
+        lv_obj_align(pip_close_, LV_ALIGN_TOP_RIGHT, -4, 4);
+        lv_obj_set_style_radius(pip_close_, 14, 0);
+        lv_obj_set_style_bg_color(pip_close_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(pip_close_, LV_OPA_70, 0);
+        lv_obj_t* xlbl = lv_label_create(pip_close_);
+        lv_label_set_text(xlbl, "x");
+        lv_obj_center(xlbl);
+        lv_obj_set_style_text_color(xlbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_remove_flag(xlbl, LV_OBJ_FLAG_CLICKABLE);
+
+        cam_full_ = lv_image_create(layout_root_);
+        if (full_px_ != nullptr) lv_image_set_src(cam_full_, &full_dsc_);
+        lv_obj_set_pos(cam_full_, 0, 0);
+        lv_obj_add_flag(cam_full_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(cam_full_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_move_background(cam_full_);
+
+        lv_obj_add_flag(pip_box_, LV_OBJ_FLAG_HIDDEN);
+        if (qibao::CameraWatchOn()) {
+            ApplyCameraMode();
+        }
+        ESP_LOGI(TAG, "摄像头按钮在右上角，小窗 %dx%d", pip_w_, pip_h_);
     }
 
     // 点旋转按钮 → 整个画面转 90°

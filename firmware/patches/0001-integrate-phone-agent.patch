@@ -618,3 +618,30 @@ index db45394..af3d2f9 100644
 +CONFIG_CAMERA_SC101IOT_DVP_DEFAULT_FMT_YUV422_640X480_15FPS=y
 +# 上电后到能做 SCCB 访问之间的延时（官方 Kconfig 默认 12ms，这里放宽到 20ms）。
 +CONFIG_CAMERA_SC101IOT_POWER_ON_DELAY_US=20000
+diff --git a/main/audio/wake_words/custom_wake_word.cc b/main/audio/wake_words/custom_wake_word.cc
+index 8759ef4..4b7a2da 100644
+--- a/main/audio/wake_words/custom_wake_word.cc
++++ b/main/audio/wake_words/custom_wake_word.cc
+@@ -99,6 +99,22 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list)
+         ParseWakenetModelConfig();
+     }
+ 
++#if defined(CONFIG_BOARD_TYPE_ESP32_S31_KORVO_1)
++    // 资源包 index.json 里通常只有一条唤醒词。七宝要三条，缺的在这里补上，不覆盖已有的。
++    auto ensure_wake = [this](const char* command, const char* text) {
++        for (const auto& existing : commands_) {
++            if (existing.command == command) {
++                return;
++            }
++        }
++        commands_.push_back({command, text, "wake"});
++        ESP_LOGI(TAG, "Command: %s, Text: %s, Action: wake", command, text);
++    };
++    ensure_wake("qi bao mei mei", "七宝妹妹");
++    ensure_wake("qi bao", "七宝");
++    ensure_wake("ni hao qi bao", "你好七宝");
++#endif
++
+     if (models_ == nullptr || models_->num == -1) {
+         ESP_LOGE(TAG, "Failed to initialize wakenet model");
+         return false;
